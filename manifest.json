@@ -1,0 +1,9 @@
+{
+  "id": "task-consolidator",
+  "name": "Task Consolidator",
+  "version": "0.2.0",
+  "minAppVersion": "1.8.0",
+  "description": "Safely consolidate daily-note tasks, reminders, notes, and archives using portable Markdown.",
+  "author": "T. Bautista",
+  "isDesktopOnly": false
+}
