@@ -1,5 +1,16 @@
 import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
 import { operonInfo, requestOperonReindex } from "./operon";
+import {
+  buildWeeklySummary,
+  composeWeeklyBody,
+  isNewWeek,
+  spliceWeeklyBlock,
+  weeklyGroup,
+  weeklyPlaceholder,
+  type WeeklyLanguage,
+  type WeeklyNoteInput,
+  type WeeklyRenderOptions,
+} from "./weekly";
 
 interface TaskConsolidatorSettings {
   dailyNotesFolder: string;
@@ -25,6 +36,10 @@ interface TaskConsolidatorSettings {
   remindersMarkerEnd: string;
   notesMarkerStart: string;
   notesMarkerEnd: string;
+  weeklySummary: boolean;
+  weeklyLanguage: WeeklyLanguage;
+  weeklyMarkerStart: string;
+  weeklyMarkerEnd: string;
 }
 
 const MARKERS = {
@@ -36,6 +51,8 @@ const MARKERS = {
   remindersEnd: "<!-- task-consolidator:reminders:end -->",
   notesStart: "<!-- task-consolidator:notes:start -->",
   notesEnd: "<!-- task-consolidator:notes:end -->",
+  weeklyStart: "<!-- task-consolidator:weekly:start -->",
+  weeklyEnd: "<!-- task-consolidator:weekly:end -->",
 };
 
 function escapeRegExp(value: string): string {
@@ -66,9 +83,22 @@ const DEFAULT_SETTINGS: TaskConsolidatorSettings = {
   remindersMarkerEnd: MARKERS.remindersEnd,
   notesMarkerStart: MARKERS.notesStart,
   notesMarkerEnd: MARKERS.notesEnd,
+  weeklySummary: true,
+  weeklyLanguage: "es",
+  weeklyMarkerStart: MARKERS.weeklyStart,
+  weeklyMarkerEnd: MARKERS.weeklyEnd,
 };
 
 interface DailyNote { file: TFile; date: string; }
+
+/**
+ * What the weekly step intends to do to today's note. Decided without writing,
+ * so the preview and the confirmation describe exactly what the write does.
+ */
+type WeeklyAction =
+  | { kind: "write"; body: string[]; headline: string }
+  | { kind: "tidy" }
+  | { kind: "none" };
 interface MarkerBlock { start: number; end: number; content: string; }
 interface PlannedMove {
   /** Normalized key of the parent line, used for de-duplication. */
@@ -108,6 +138,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
     // Acota los valores cargados (data.json) a rangos seguros: 3–30 en ambos casos.
     this.settings.daysToScan = Math.min(30, Math.max(3, Math.floor(this.settings.daysToScan) || DEFAULT_SETTINGS.daysToScan));
     this.settings.maxDailyNotes = Math.min(30, Math.max(3, Math.floor(this.settings.maxDailyNotes) || DEFAULT_SETTINGS.maxDailyNotes));
+    if (this.settings.weeklyLanguage !== "en") this.settings.weeklyLanguage = "es";
     this.addCommand({ id: "preview-consolidation", name: "Preview daily consolidation", callback: () => this.previewConsolidation() });
     this.addCommand({ id: "consolidate-daily-note", name: "Consolidate current daily note", callback: () => this.consolidateCurrentDailyNote() });
     this.addCommand({ id: "migrate-daily-material", name: "Migrate previous daily notes material", callback: () => this.migratePreviousMaterial() });
@@ -143,6 +174,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
       ["cancelled", this.settings.cancelledMarkerStart, this.settings.cancelledMarkerEnd],
       ["reminders", this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd],
       ["notes", this.settings.notesMarkerStart, this.settings.notesMarkerEnd],
+      ["weekly", this.settings.weeklyMarkerStart, this.settings.weeklyMarkerEnd],
     ] as const) {
       const hasStart = content.includes(start), hasEnd = content.includes(end);
       if (hasStart !== hasEnd) errors.push(`${name}: incomplete marker pair`);
@@ -279,7 +311,8 @@ export default class TaskConsolidatorPlugin extends Plugin {
   private async previewConsolidation(): Promise<void> {
     const current = await this.currentDailyNote();
     if (current === null) { new Notice("Task Consolidator: today's daily note was not found."); return; }
-    const errors = this.validateManagedBlocks(await this.app.vault.read(current.file));
+    const currentContent = await this.app.vault.read(current.file);
+    const errors = this.validateManagedBlocks(currentContent);
     if (errors.length > 0) { new Notice(`Task Consolidator: cannot preview; ${errors.join("; ")}`); return; }
     const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
     const pending = await this.planMoves(notes, "pending");
@@ -287,12 +320,21 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const noteCount = new Set([...pending.sources.keys(), ...cancelled.sources.keys()]).size;
     const parts = [`${pending.moves.length} pending task(s)`];
     if (cancelled.moves.length > 0) parts.push(`${cancelled.moves.length} cancelled task(s)`);
+    // The manual commands write the summary whenever the block is untouched (no
+    // week gate: you asked for it), so the preview mirrors exactly that.
+    const weekly = await this.weeklyAction(current, false);
+    const weeklyNote = weekly.kind === "write"
+      ? ` Weekly summary ready: ${weekly.headline}.`
+      : weekly.kind === "tidy"
+        ? " The empty weekly section left by the template would be removed."
+        : "";
     const operon = await operonInfo(this);
-    new Notice(`Task Consolidator: ${parts.join(", ")} to move from ${noteCount} previous note(s). ${operon.present ? operon.detail : "Operon not enabled."}`);
+    new Notice(`Task Consolidator: ${parts.join(", ")} to move from ${noteCount} previous note(s).${weeklyNote} ${operon.present ? operon.detail : "Operon not enabled."}`);
     console.info("Task Consolidator preview", {
       current: current.file.path,
       pending: [...pending.sources.entries()].map(([path, { moves: sourceMoves }]) => ({ path, tasks: sourceMoves.map((move) => move.parent) })),
       cancelled: [...cancelled.sources.entries()].map(([path, { moves: sourceMoves }]) => ({ path, tasks: sourceMoves.map((move) => move.parent) })),
+      weekly: weekly.kind === "write" ? weekly.headline : weekly.kind,
       operon,
     });
   }
@@ -308,12 +350,30 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
     const pending = await this.planMoves(notes, "pending");
     const cancelled = this.settings.includeCancelled ? await this.planMoves(notes, "cancelled") : this.emptyResult();
-    if (pending.moves.length === 0 && cancelled.moves.length === 0) { new Notice("Task Consolidator: no pending or cancelled tasks to move in the previous daily notes."); return; }
-    const parts = [`${pending.moves.length} pending task(s) from ${pending.sources.size} note(s)`];
+    // Mirror exactly what will happen: the manual path has no week gate, but it
+    // still needs an untouched weekly block (and the setting on) to write into.
+    const weekly = await this.weeklyAction(current, false);
+    const hasMoves = pending.moves.length > 0 || cancelled.moves.length > 0;
+    if (!hasMoves && weekly.kind === "none") { new Notice("Task Consolidator: no pending or cancelled tasks to move in the previous daily notes."); return; }
+    const parts: string[] = [];
+    if (pending.moves.length > 0) parts.push(`${pending.moves.length} pending task(s) from ${pending.sources.size} note(s)`);
     if (cancelled.moves.length > 0) parts.push(`${cancelled.moves.length} cancelled task(s) from ${cancelled.sources.size} note(s)`);
-    const summary = `Move ${parts.join(" and ")} into today's daily note? Tasks already present in today's note are left there and only removed from the source.`;
+    const question = hasMoves
+      ? `Move ${parts.join(" and ")} into today's daily note? Tasks already present in today's note are left there and only removed from the source.`
+      : "Nothing to move into today's daily note.";
+    const weeklyNote = weekly.kind === "write"
+      ? " A summary of the previous week's daily notes will be written into the weekly block."
+      : weekly.kind === "tidy"
+        ? " The empty weekly section left by the template will be removed."
+        : "";
+    const summary = `${question}${weeklyNote}`;
     new ConfirmationModal(this.app, summary, async () => {
-      await this.applyConsolidation(current, pending, cancelled);
+      const weeklyWritten = await this.maybeWriteWeeklySummary(current, false);
+      if (!hasMoves) {
+        new Notice(weeklyWritten ? "Task Consolidator: weekly summary of the previous week written." : "Task Consolidator: empty weekly section removed.");
+        return;
+      }
+      await this.applyConsolidation(current, pending, cancelled, weeklyWritten);
     }).open();
   }
 
@@ -326,7 +386,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * first). If today's note has no cancelled block, cancelled tasks are left in
    * place instead of being lost.
    */
-  private async applyConsolidation(current: DailyNote, pending: PlannedResult, cancelled: PlannedResult): Promise<void> {
+  private async applyConsolidation(current: DailyNote, pending: PlannedResult, cancelled: PlannedResult, weeklyWritten = false): Promise<void> {
     const pendingRes = await this.applyInsertToCurrent(current, pending.moves, "pending");
     if (!pendingRes.blockFound && pending.moves.length > 0) {
       new Notice("Task Consolidator: today's tasks block was not found on re-read; nothing was changed.");
@@ -353,7 +413,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
         removedCancelled += await this.applySourceRemoval(note, moves, current.date, "cancelled");
       }
     }
-    new Notice(`Task Consolidator: inserted ${pendingRes.inserted} pending and ${insertedCancelled} cancelled task(s); marked ${removedPending + removedCancelled} line(s) as moved.`);
+    new Notice(`Task Consolidator: inserted ${pendingRes.inserted} pending and ${insertedCancelled} cancelled task(s); marked ${removedPending + removedCancelled} line(s) as moved.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
     await this.reportOperonAfterChange();
     if (this.settings.autoArchive) await this.archiveOldDailyNotes();
   }
@@ -459,6 +519,106 @@ export default class TaskConsolidatorPlugin extends Plugin {
     }
   }
 
+  /** Options the weekly renderer needs, taken from this plugin's settings. */
+  private weeklyRenderOptions(): WeeklyRenderOptions {
+    return {
+      taskTag: this.taskTag(),
+      language: this.settings.weeklyLanguage,
+      markers: {
+        tasksStart: this.settings.tasksMarkerStart,
+        tasksEnd: this.settings.tasksMarkerEnd,
+        cancelledStart: this.settings.cancelledMarkerStart,
+        cancelledEnd: this.settings.cancelledMarkerEnd,
+      },
+    };
+  }
+
+  /**
+   * The daily notes of the week the most recent previous daily note belongs to,
+   * ascending — the group the summary reports on. `null` when there is no
+   * previous daily note, or when `requireNewWeek` is set and this note does not
+   * open a new ISO week: the report answers "what happened in the last week you
+   * actually worked on", so on the automatic path it belongs to the note that
+   * opens a week, never to every note of that week.
+   */
+  private async previousWeekNotes(current: DailyNote, requireNewWeek: boolean): Promise<DailyNote[] | null> {
+    const notes = await this.getDailyNotes();
+    const previous = notes.find((note) => note.date < current.date);
+    if (previous === undefined) return null;
+    if (requireNewWeek && !isNewWeek(previous.date, current.date)) return null;
+    const byDate = new Map(notes.map((note) => [note.date, note]));
+    return weeklyGroup(previous.date, notes.map((note) => note.date))
+      .map((date) => byDate.get(date))
+      .filter((note): note is DailyNote => note !== undefined);
+  }
+
+  /**
+   * Renders the previous week's summary, or `null` when there is nothing to
+   * report (setting off, no previous daily note, or — on the automatic path —
+   * the same week). Reading only the notes of that group is the whole point:
+   * the vault is never swept.
+   */
+  private async weeklySummaryBody(current: DailyNote, requireNewWeek: boolean): Promise<string[] | null> {
+    if (!this.settings.weeklySummary) return null;
+    const notes = await this.previousWeekNotes(current, requireNewWeek);
+    if (notes === null || notes.length === 0) return null;
+    const inputs: WeeklyNoteInput[] = [];
+    for (const note of notes) inputs.push({ date: note.date, content: await this.app.vault.read(note.file) });
+    return buildWeeklySummary(inputs, this.weeklyRenderOptions());
+  }
+
+  /**
+   * Decides, without writing, what the weekly step would do to today's note:
+   *
+   *  - `write`: a report is due and the block is untouched, so the report (with
+   *    the template's heading carried over) goes in.
+   *  - `tidy`: nothing is due — the setting is off, or this note does not open a
+   *    new week, or there is no previous daily note — and the block is only a
+   *    placeholder, so it is emptied. The template produces its heading on
+   *    *every* daily note, and this is what keeps the section title from hanging
+   *    empty on the days that have no report to show.
+   *  - `none`: nothing to do (no block, or the block holds real content).
+   *
+   * A block holding anything beyond a heading and blank lines — a summary
+   * already written, or text of your own — is never a placeholder, so it is
+   * never emptied and never overwritten.
+   */
+  private async weeklyAction(current: DailyNote, requireNewWeek: boolean): Promise<WeeklyAction> {
+    const content = await this.app.vault.read(current.file);
+    const block = this.findBlock(content, this.settings.weeklyMarkerStart, this.settings.weeklyMarkerEnd);
+    if (block === null) return { kind: "none" };
+    const headings = weeklyPlaceholder(block.content);
+    if (headings === null) return { kind: "none" };
+    const report = await this.weeklySummaryBody(current, requireNewWeek);
+    if (report !== null) return { kind: "write", body: composeWeeklyBody(headings, report), headline: report[0] };
+    return headings.length === 0 ? { kind: "none" } : { kind: "tidy" };
+  }
+
+  /**
+   * Applies the weekly action. `requireNewWeek` is set on the automatic path
+   * (the report belongs to the note that opens a week); the manual commands pass
+   * `false`, so you can also ask for it explicitly later.
+   *
+   * It runs *before* consolidation on purpose: consolidation moves the pending
+   * tasks out of the previous week's notes, so reading them afterwards would
+   * report "no pending tasks" for a week that did leave some open.
+   */
+  private async maybeWriteWeeklySummary(current: DailyNote, requireNewWeek: boolean): Promise<boolean> {
+    const action = await this.weeklyAction(current, requireNewWeek);
+    if (action.kind === "none") return false;
+    // Re-read and re-verify just before writing, like every other write here.
+    const content = await this.app.vault.read(current.file);
+    const block = this.findBlock(content, this.settings.weeklyMarkerStart, this.settings.weeklyMarkerEnd);
+    if (block === null || weeklyPlaceholder(block.content) === null) return false;
+    if (action.kind === "write") {
+      await this.app.vault.modify(current.file, spliceWeeklyBlock(content, block, action.body));
+      return true;
+    }
+    console.info("Task Consolidator: the untouched weekly section was emptied.");
+    await this.app.vault.modify(current.file, spliceWeeklyBlock(content, block, []));
+    return false;
+  }
+
   private async migratePreviousMaterial(): Promise<void> {
     const current = await this.currentDailyNote();
     if (current === null) { new Notice("Task Consolidator: today's daily note was not found."); return; }
@@ -474,10 +634,12 @@ export default class TaskConsolidatorPlugin extends Plugin {
 
   /**
    * Automatic entry point used when today's daily note is created. Runs without
-   * confirmation: migrates notes/reminders from the previous note, then
-   * consolidates pending and cancelled tasks. Every sub-operation re-reads its
-   * files and is idempotent, so even a repeated run converges to the same
-   * result.
+   * confirmation: migrates notes/reminders from the previous note, writes the
+   * previous week's summary when this note opens a new week (and only then), and
+   * consolidates pending and cancelled tasks. The summary is built before the
+   * tasks move, so the previous week's pending work is still where it was.
+   * Every sub-operation re-reads its files and is idempotent, so even a repeated
+   * run converges to the same result.
    */
   private async runAutomaticConsolidation(): Promise<void> {
     const current = await this.currentDailyNote();
@@ -488,14 +650,15 @@ export default class TaskConsolidatorPlugin extends Plugin {
       return;
     }
     await this.applyMaterialChanges((await this.buildMaterialChanges(current)).changes);
+    const weeklyWritten = await this.maybeWriteWeeklySummary(current, true);
     const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
     const pending = await this.planMoves(notes, "pending");
     const cancelled = this.settings.includeCancelled ? await this.planMoves(notes, "cancelled") : this.emptyResult();
     if (pending.moves.length === 0 && cancelled.moves.length === 0) {
-      new Notice("Task Consolidator: automatic run finished; no pending or cancelled tasks to move.");
+      new Notice(`Task Consolidator: automatic run finished; no pending or cancelled tasks to move.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
       return;
     }
-    await this.applyConsolidation(current, pending, cancelled);
+    await this.applyConsolidation(current, pending, cancelled, weeklyWritten);
   }
 
   /**
@@ -574,6 +737,8 @@ class TaskConsolidatorSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Maximum daily notes").setDesc("How many daily notes to keep before the oldest are archived when archiving runs (3–30).").addText((text) => text.setValue(String(this.plugin.settings.maxDailyNotes)).onChange(async (value) => { const n = Math.floor(Number(value)); if (Number.isFinite(n)) { this.plugin.settings.maxDailyNotes = Math.min(30, Math.max(3, n)); await this.plugin.saveSettings(); } }));
     new Setting(containerEl).setName("Automatic archiving").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoArchive).onChange(async (value) => { this.plugin.settings.autoArchive = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Run automatically when today's note is created").setDesc("When today's daily note is created with the managed markers, automatically consolidate pending and cancelled tasks and migrate reminders and notes from the previous note. Runs at most once per day.").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoConsolidate).onChange(async (value) => { this.plugin.settings.autoConsolidate = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Weekly summary of the previous week").setDesc("When the first daily note of a new week is created, write a report of the previous week's daily notes (pending, completed and cancelled tasks) inside the weekly marker block. The report is inert — no checkboxes, no task metadata, no task tag — so it is never consolidated. The template's heading is carried over, and whenever no report is due — the other days of the week, or this setting being off — the untouched section is emptied, so the template's heading never hangs empty in the note. An existing summary, or text of your own, is never overwritten.").addToggle((toggle) => toggle.setValue(this.plugin.settings.weeklySummary).onChange(async (value) => { this.plugin.settings.weeklySummary = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Weekly summary language").setDesc("Language of the weekly summary text. Task lines are copied verbatim in whatever language you wrote them.").addDropdown((dropdown) => dropdown.addOption("es", "Español").addOption("en", "English").setValue(this.plugin.settings.weeklyLanguage).onChange(async (value) => { this.plugin.settings.weeklyLanguage = value === "en" ? "en" : "es"; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Include cancelled tasks").setDesc("Move tasks marked cancelled (- [-]) from previous notes into today's '## Tareas canceladas' block. Completed tasks (- [x]) are never moved.").addToggle((toggle) => toggle.setValue(this.plugin.settings.includeCancelled).onChange(async (value) => { this.plugin.settings.includeCancelled = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Task tag").setDesc("Tag appended to migrated pending task lines that do not carry it yet (e.g. #task). Leave empty to add no tag.").addText((text) => text.setValue(this.plugin.settings.taskTag).onChange(async (value) => { this.plugin.settings.taskTag = value.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Stamp created date on plain tasks").setDesc("Append ' ➕ YYYY-MM-DD' (the date of the daily note the task came from) to migrated pending tasks that have no Operon metadata and no ➕ date yet. Tasks already carrying a ➕ date, and Operon tasks (which keep their own structured dates), are left untouched.").addToggle((toggle) => toggle.setValue(this.plugin.settings.stampCreatedDate).onChange(async (value) => { this.plugin.settings.stampCreatedDate = value; await this.plugin.saveSettings(); }));

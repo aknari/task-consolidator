@@ -36,9 +36,11 @@ declare module "obsidian" {
     setDesc(desc: string): this;
     addText(callback: (component: TextComponent) => unknown): this;
     addToggle(callback: (component: ToggleComponent) => unknown): this;
+    addDropdown(callback: (component: DropdownComponent) => unknown): this;
     addButton(callback: (component: ButtonComponent) => unknown): this;
   }
   export class TextComponent { setValue(value: string): this; onChange(callback: (value: string) => void | Promise<void>): this; }
+  export class DropdownComponent { addOption(value: string, display: string): this; setValue(value: string): this; onChange(callback: (value: string) => void | Promise<void>): this; }
   export class ToggleComponent { setValue(value: boolean): this; onChange(callback: (value: boolean) => void | Promise<void>): this; }
   export class ButtonComponent { setButtonText(text: string): this; setCta(): this; setDisabled(value: boolean): this; onClick(callback: () => void | Promise<void>): this; }
   export class Modal { constructor(app: App); contentEl: HTMLElement; open(): void; close(): void; }
