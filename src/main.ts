@@ -1,6 +1,16 @@
 import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
 import { operonInfo, requestOperonReindex } from "./operon";
 import {
+  isOperonLine,
+  normalizeTaskLine,
+  prepareMigratedLine,
+  stampOperonStart,
+  taskKey,
+  tombstoneLine,
+  tombstoneOperonLines,
+  type LineOptions,
+} from "./lines";
+import {
   buildWeeklySummary,
   composeWeeklyBody,
   isNewWeek,
@@ -54,10 +64,6 @@ const MARKERS = {
   weeklyStart: "<!-- task-consolidator:weekly:start -->",
   weeklyEnd: "<!-- task-consolidator:weekly:end -->",
 };
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 const DEFAULT_SETTINGS: TaskConsolidatorSettings = {
   dailyNotesFolder: "10-journal/daily notes",
@@ -192,48 +198,9 @@ export default class TaskConsolidatorPlugin extends Plugin {
   /** The configured task tag (trimmed); empty disables tag stamping. */
   private taskTag(): string { return this.settings.taskTag.trim(); }
 
-  /** Whether the given standalone tag token appears in the line. */
-  private tagPresent(line: string, tag: string): boolean {
-    return new RegExp(`(^|\\s)${escapeRegExp(tag)}(?!\\S)`, "u").test(line);
-  }
-
-  /**
-   * Canonical form of a task line used for keys and comparisons: converts
-   * `- [!]` to `- [ ]`, collapses whitespace, and drops the managed task tag
-   * and any ` ➕ YYYY-MM-DD` stamp. Decorated and undecorated copies of the
-   * same task therefore compare equal, which keeps de-duplication and source
-   * removal correct whether lines were stamped by this plugin or not.
-   */
-  private normalizeTaskLine(line: string): string {
-    let normalized = line.replace(/- \[!\]/, "- [ ]");
-    const tag = this.taskTag();
-    if (tag !== "") normalized = normalized.replace(new RegExp(`(^|\\s)${escapeRegExp(tag)}(?!\\S)`, "gu"), "$1");
-    normalized = normalized.replace(/\s*➕\s*\d{4}-\d{2}-\d{2}/gu, "");
-    return normalized.trimEnd().replace(/\s+/g, " ");
-  }
-
-  /**
-   * Prepares the parent line of a pending move for insertion into today's
-   * note: converts `- [!]` to `- [ ]`, appends the managed task tag when the
-   * line does not carry it yet, and stamps a ` ➕ YYYY-MM-DD` created date
-   * (the date of the source daily note) on plain tasks that have neither
-   * Operon metadata nor a ➕ date of their own. Operon tasks are left alone:
-   * they already carry their dates as structured `{{...}}` metadata.
-   */
-  private decoratePendingLine(line: string, sourceDate: string): string {
-    const s = line.replace(/- \[!\]/, "- [ ]").trimEnd();
-    const braceIdx = s.indexOf("{{");
-    const hasBraces = braceIdx >= 0;
-    const isOperon = /\{\{\s*operonId\s*::/.test(s);
-    const parts: string[] = [];
-    const tag = this.taskTag();
-    if (tag !== "" && !this.tagPresent(s, tag)) parts.push(tag);
-    if (this.settings.stampCreatedDate && !isOperon && !/\s*➕\s*\d{4}-\d{2}-\d{2}/u.test(s)) parts.push(`➕ ${sourceDate}`);
-    if (parts.length === 0) return s;
-    const head = hasBraces ? s.slice(0, braceIdx).trimEnd() : s;
-    const tail = hasBraces ? s.slice(braceIdx).trimStart() : "";
-    const suffix = parts.map((part) => ` ${part}`).join("");
-    return tail === "" ? `${head}${suffix}` : `${head}${suffix} ${tail}`;
+  /** Options the line helpers need, taken from this plugin's settings. */
+  private lineOptions(): LineOptions {
+    return { taskTag: this.taskTag(), stampCreatedDate: this.settings.stampCreatedDate };
   }
 
   private kindSpec(kind: MoveKind): KindSpec {
@@ -278,8 +245,8 @@ export default class TaskConsolidatorPlugin extends Plugin {
         while (i < lines.length) {
           const line = lines[i];
           if (!spec.isTarget(line)) { i += 1; continue; }
-          const parent = this.normalizeTaskLine(line);
-          const key = parent;
+          const parent = normalizeTaskLine(line, this.taskTag());
+          const key = taskKey(line, this.taskTag());
           const indent = line.match(/^\s*/)?.[0].length ?? 0;
           const subtree: string[] = [line];
           let j = i + 1;
@@ -290,7 +257,12 @@ export default class TaskConsolidatorPlugin extends Plugin {
             subtree.push(child);
             j += 1;
           }
-          if (!seen.has(key)) {
+          // An Operon task is planned once per copy on purpose: if one operonId
+          // ended up in more than one note, every stale copy has to be
+          // tombstoned, while only one line reaches today's note (the insert
+          // skips a task that is already there). Plain tasks keep the old
+          // de-duplication by text.
+          if (isOperonLine(line) || !seen.has(key)) {
             seen.add(key);
             const move: PlannedMove = { key, parent, lines: subtree, date: note.date };
             moves.push(move);
@@ -431,12 +403,13 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const block = this.findBlock(content, startMarker, endMarker);
     if (block === null) return { inserted: 0, blockFound: false };
     const lines = content.split("\n");
-    const existingKeys = new Set(lines.slice(block.start + 1, block.end).filter((line) => /^\s*- \[[^]]+\]/.test(line)).map((line) => this.normalizeTaskLine(line)));
+    const existingKeys = this.existingTaskKeys(lines, block);
+    const options = this.lineOptions();
     const toInsert: string[] = [];
     for (const move of moves) {
       if (existingKeys.has(move.key)) continue;
       existingKeys.add(move.key);
-      const insertLines = move.lines.map((line, index) => (kind === "pending" && index === 0) ? this.decoratePendingLine(line, move.date) : line);
+      const insertLines = move.lines.map((line, index) => (kind === "pending" && index === 0) ? prepareMigratedLine(line, move.date, options) : line);
       toInsert.push(...insertLines);
     }
     if (toInsert.length === 0) return { inserted: 0, blockFound: true };
@@ -446,45 +419,69 @@ export default class TaskConsolidatorPlugin extends Plugin {
   }
 
   /**
-   * Removes the moved task lines of a kind from a source note and leaves a
-   * non-destructive HTML comment in their place. Re-reads the note, re-finds
-   * the relevant block(s), and re-locates each parent line by its normalized
-   * content before touching anything, so a note that changed between planning
-   * and applying is left untouched rather than edited on stale assumptions.
-   * Subtask lines indented under a removed parent are removed with it; every
-   * occurrence of a planned key is removed (cancelled lines can appear in both
-   * the tasks and the cancelled block).
+   * Keys already present in today's note: every task line inside the target
+   * block, plus — for Operon tasks — any line anywhere in the note. An Operon
+   * task that already lives in today's note (its reminders block, its notes
+   * block, its body) is never inserted a second time: two lines claiming one
+   * `operonId` is the clash Operon can only resolve by hand.
+   */
+  private existingTaskKeys(lines: string[], block: MarkerBlock): Set<string> {
+    const tag = this.taskTag();
+    const keys = new Set<string>();
+    for (const line of lines.slice(block.start + 1, block.end)) {
+      if (/^\s*- \[[^]]+\]/.test(line)) keys.add(taskKey(line, tag));
+    }
+    for (const line of lines) if (isOperonLine(line)) keys.add(taskKey(line, tag));
+    return keys;
+  }
+
+  /**
+   * Marks the moved task lines of a kind in a source note as carried forward:
+   * each one stays in place as `- [>]` — the convention the legacy notes and
+   * the old Python script already use — keeping its text as the record of what
+   * was there, and a non-destructive HTML comment says where the work went.
+   *
+   * The tombstone drops the Operon `{{...}}` fields, and that is the point: the
+   * live copy in today's note now holds that `operonId`, and a second line
+   * claiming it is exactly the duplicate Operon makes you resolve by hand.
+   *
+   * Re-reads the note, re-finds the relevant block(s), and re-locates each
+   * parent line by its key (its `operonId`, or its normalized text) before
+   * touching anything, so a note that changed between planning and applying is
+   * left untouched rather than edited on stale assumptions. Subtask lines
+   * indented under a marked parent are marked with it; every occurrence of a
+   * planned key is marked (cancelled lines can appear in both the tasks and the
+   * cancelled block).
    */
   private async applySourceRemoval(note: DailyNote, moves: PlannedMove[], destinationDate: string, kind: MoveKind): Promise<number> {
-    const spec = this.kindSpec(kind);
+    const spec = this.kindSpec(kind), tag = this.taskTag();
     const content = await this.app.vault.read(note.file);
     const lines = content.split("\n");
-    const removeIdx = new Set<number>();
+    const markedIdx = new Set<number>();
     for (const [startMarker, endMarker] of spec.blocks) {
       const block = this.findBlock(content, startMarker, endMarker);
       if (block === null) continue;
       for (const move of moves) {
         for (let k = block.start + 1; k < block.end; k += 1) {
-          if (removeIdx.has(k) || this.normalizeTaskLine(lines[k]) !== move.key) continue;
+          if (markedIdx.has(k) || taskKey(lines[k], tag) !== move.key) continue;
           const indent = lines[k].match(/^\s*/)?.[0].length ?? 0;
-          removeIdx.add(k);
+          markedIdx.add(k);
           let j = k + 1;
           while (j < block.end) {
             const child = lines[j];
             const childIndent = child.match(/^\s*/)?.[0].length ?? 0;
             if (!/^\s*- \[/.test(child) || childIndent <= indent) break;
-            removeIdx.add(j);
+            markedIdx.add(j);
             j += 1;
           }
         }
       }
     }
-    if (removeIdx.size === 0) return 0;
-    const firstIdx = Math.min(...removeIdx);
-    for (const idx of [...removeIdx].sort((a, b) => b - a)) lines.splice(idx, 1);
-    lines.splice(firstIdx, 0, `<!-- task-consolidator:moved ${removeIdx.size} ${spec.comment} to ${destinationDate} -->`);
+    if (markedIdx.size === 0) return 0;
+    for (const idx of markedIdx) lines[idx] = tombstoneLine(lines[idx]);
+    lines.splice(Math.min(...markedIdx), 0, `<!-- task-consolidator:moved ${markedIdx.size} ${spec.comment} to ${destinationDate} -->`);
     await this.app.vault.modify(note.file, lines.join("\n"));
-    return removeIdx.size;
+    return markedIdx.size;
   }
 
   /** Builds the list of Markdown changes that migrate notes and reminders from
@@ -499,16 +496,55 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const sourceReminders = this.findBlock(source, this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd);
     const currentReminders = this.findBlock(currentContent, this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd);
     const changes: Array<{ path: string; content: string }> = [];
-    if (this.settings.migrateNotes && sourceNotes?.content.trim()) changes.push({ path: this.settings.notesFile, content: await this.appendDatedBlock(this.settings.notesFile, "Notes", previous.date, sourceNotes.content) });
+    // A recorded copy never holds a live Operon task: the dated files, and the
+    // previous note once its reminder has moved on, keep their Operon lines as
+    // tombstones, so one `operonId` is never claimed twice. The copy someone
+    // keeps working with is the live one — today's note for a reminder, the
+    // source note itself for a miscellaneous note, which has no other home.
+    if (this.settings.migrateNotes && sourceNotes?.content.trim()) {
+      changes.push({ path: this.settings.notesFile, content: await this.appendDatedBlock(this.settings.notesFile, "Notes", previous.date, tombstoneOperonLines(sourceNotes.content)) });
+    }
     if (this.settings.migrateReminders && sourceReminders?.content.trim()) {
-      changes.push({ path: this.settings.remindersFile, content: await this.appendDatedBlock(this.settings.remindersFile, "Reminders", previous.date, sourceReminders.content) });
-      if (currentReminders !== null) {
+      // The dated marker is this migration's own record that the previous note
+      // has already been carried. Running again the same day must change
+      // nothing: re-injecting the block would overwrite the live copy today's
+      // note already holds with the tombstones the source now keeps, and that
+      // is the one way this could lose a task.
+      const archive = this.app.vault.getAbstractFileByPath(this.settings.remindersFile);
+      const archiveContent = archive instanceof TFile ? await this.app.vault.read(archive) : "";
+      if (archiveContent.includes(this.datedMarker("Reminders", previous.date))) return { changes, previous, reason: null };
+      changes.push({ path: this.settings.remindersFile, content: await this.appendDatedBlock(this.settings.remindersFile, "Reminders", previous.date, tombstoneOperonLines(sourceReminders.content)) });
+      // What today's note receives is live material only: a line already marked
+      // as carried forward is a record, not a reminder, and re-inserting it
+      // would put the tombstone in the place the live task used to be.
+      const live = sourceReminders.content.trim().split("\n")
+        .filter((line) => !/^\s*- \[>\]/.test(line))
+        .slice(0, this.settings.recentReminders)
+        .map((line) => (this.settings.stampCreatedDate ? stampOperonStart(line, previous.date) : line));
+      if (currentReminders !== null && live.length > 0) {
         const lines = currentContent.split("\n");
-        lines.splice(currentReminders.start + 1, currentReminders.end - currentReminders.start - 1, ...sourceReminders.content.trim().split("\n").slice(0, this.settings.recentReminders));
+        lines.splice(currentReminders.start + 1, currentReminders.end - currentReminders.start - 1, ...live);
         changes.push({ path: current.file.path, content: lines.join("\n") });
       }
+      const tombstoned = this.tombstoneOperonBlock(source, sourceReminders);
+      if (tombstoned !== null) changes.push({ path: previous.file.path, content: tombstoned });
     }
     return { changes, previous, reason: null };
+  }
+
+  /**
+   * The note with the Operon lines of one block turned into tombstones, or
+   * `null` when it held none (nothing to write, and the note is left alone).
+   */
+  private tombstoneOperonBlock(content: string, block: MarkerBlock): string | null {
+    const lines = content.split("\n");
+    let touched = false;
+    for (let i = block.start + 1; i < block.end; i += 1) {
+      if (!isOperonLine(lines[i])) continue;
+      lines[i] = tombstoneLine(lines[i]);
+      touched = true;
+    }
+    return touched ? lines.join("\n") : null;
   }
 
   private async applyMaterialChanges(changes: Array<{ path: string; content: string }>): Promise<void> {
@@ -698,10 +734,15 @@ export default class TaskConsolidatorPlugin extends Plugin {
     }
   }
 
+  /** The dated marker that records one block of one daily note as archived. */
+  private datedMarker(kind: string, date: string): string {
+    return `<!-- task-consolidator:${kind.toLowerCase()}:${date} -->`;
+  }
+
   private async appendDatedBlock(path: string, kind: string, date: string, body: string): Promise<string> {
     const existing = this.app.vault.getAbstractFileByPath(path);
     const content = existing instanceof TFile ? await this.app.vault.read(existing) : "";
-    const marker = `<!-- task-consolidator:${kind.toLowerCase()}:${date} -->`;
+    const marker = this.datedMarker(kind, date);
     if (content.includes(marker)) return content;
     return `${content.trimEnd()}${content.trim() ? "\n\n" : ""}${marker}\n## ${kind} from ${date}\n${body.trim()}\n`;
   }
@@ -741,7 +782,7 @@ class TaskConsolidatorSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Weekly summary language").setDesc("Language of the weekly summary text. Task lines are copied verbatim in whatever language you wrote them.").addDropdown((dropdown) => dropdown.addOption("es", "Español").addOption("en", "English").setValue(this.plugin.settings.weeklyLanguage).onChange(async (value) => { this.plugin.settings.weeklyLanguage = value === "en" ? "en" : "es"; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Include cancelled tasks").setDesc("Move tasks marked cancelled (- [-]) from previous notes into today's '## Tareas canceladas' block. Completed tasks (- [x]) are never moved.").addToggle((toggle) => toggle.setValue(this.plugin.settings.includeCancelled).onChange(async (value) => { this.plugin.settings.includeCancelled = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Task tag").setDesc("Tag appended to migrated pending task lines that do not carry it yet (e.g. #task). Leave empty to add no tag.").addText((text) => text.setValue(this.plugin.settings.taskTag).onChange(async (value) => { this.plugin.settings.taskTag = value.trim(); await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Stamp created date on plain tasks").setDesc("Append ' ➕ YYYY-MM-DD' (the date of the daily note the task came from) to migrated pending tasks that have no Operon metadata and no ➕ date yet. Tasks already carrying a ➕ date, and Operon tasks (which keep their own structured dates), are left untouched.").addToggle((toggle) => toggle.setValue(this.plugin.settings.stampCreatedDate).onChange(async (value) => { this.plugin.settings.stampCreatedDate = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Carry the source date onto migrated tasks").setDesc("Record the day a task came from on the line carried into today's note: a plain task gets ' ➕ YYYY-MM-DD' (unless it already has a ➕ date) and an Operon task with no start date gets '{{dateStarted:: YYYY-MM-DD}}'. Tasks that already carry their own date are left untouched.").addToggle((toggle) => toggle.setValue(this.plugin.settings.stampCreatedDate).onChange(async (value) => { this.plugin.settings.stampCreatedDate = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Migrate miscellaneous notes").addToggle((toggle) => toggle.setValue(this.plugin.settings.migrateNotes).onChange(async (value) => { this.plugin.settings.migrateNotes = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Migrate reminders").addToggle((toggle) => toggle.setValue(this.plugin.settings.migrateReminders).onChange(async (value) => { this.plugin.settings.migrateReminders = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Recent reminders").addText((text) => text.setValue(String(this.plugin.settings.recentReminders)).onChange(async (value) => { const n = Number(value); if (Number.isFinite(n) && n >= 0) { this.plugin.settings.recentReminders = Math.floor(n); await this.plugin.saveSettings(); } }));

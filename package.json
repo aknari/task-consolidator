@@ -1,11 +1,13 @@
 {
   "name": "task-consolidator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "build": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --platform=browser --target=es2020 --outfile=../../.obsidian/plugins/task-consolidator/main.js",
     "typecheck": "tsc --noEmit",
-    "test": "esbuild test/weekly.test.ts --bundle --platform=node --format=cjs --outfile=.test/weekly.test.cjs && node .test/weekly.test.cjs"
+    "test": "npm run test:weekly && npm run test:lines",
+    "test:weekly": "esbuild test/weekly.test.ts --bundle --platform=node --format=cjs --outfile=.test/weekly.test.cjs && node .test/weekly.test.cjs",
+    "test:lines": "esbuild test/lines.test.ts --bundle --platform=node --format=cjs --outfile=.test/lines.test.cjs && node .test/lines.test.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

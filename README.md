@@ -4,14 +4,14 @@
 
 Consolidate pending and cancelled tasks from your previous daily notes into today's daily note, migrate reminders and miscellaneous notes to dated files, and archive old daily notes — automatically when your daily note is created. Tasks are moved as plain Markdown lines, so nothing depends on a proprietary format.
 
-Works with or without [Operon](https://github.com/hasanyilmaz/operon): task metadata (including `operonId`, `parentTask`, dates and priorities) travels verbatim, so Operon keeps recognizing the same tasks after a move.
+Works with or without [Operon](https://github.com/hasanyilmaz/operon): task metadata (including `operonId`, `parentTask`, dates and priorities) travels verbatim, so Operon keeps recognizing the same tasks after a move — and nothing is ever left behind claiming an identity that has moved on.
 
 ## Features
 
-- **Pending task consolidation (real move).** `- [ ]` and `- [!]` tasks from previous daily notes are moved — not copied — into today's tasks block. The full line (including any `{{...}}` metadata) is relocated verbatim — with the managed task tag added to the parent line when missing and, for plain tasks without dates of their own, a ` ➕ YYYY-MM-DD` created-date stamp — and the source is replaced by a non-destructive comment. No second `operonId` is ever generated.
+- **Pending task consolidation (real move).** `- [ ]` and `- [!]` tasks from previous daily notes are moved — not copied — into today's tasks block. The full line is relocated verbatim: a plain task gets the managed tag when it carries none and, if it has no date of its own, a ` ➕ YYYY-MM-DD` stamp with the day it came from; an Operon task is never decorated — its `{{...}}` fields are what keeps it the same task — except for the `{{dateStarted:: YYYY-MM-DD}}` it lacks. The source keeps the line as `- [>]`, the convention the legacy notes already use, with a non-destructive comment saying where the work went and with the Operon metadata removed, so no second line ever claims that `operonId`.
 - **Cancelled task carry-forward.** Tasks marked `- [-]` are moved into today's `## Tareas canceladas` block, so discarded tasks keep following you in case you want to rescue them. Completed tasks (`- [x]`) are never moved.
 - **Weekly summary.** When the first daily note of a new week is created, a report of the previous week's daily notes — pending, completed and cancelled tasks — is written into the weekly block. It is deliberately inert (no checkboxes, no task metadata, no task tag), so it is never mistaken for work to consolidate. See [Weekly summary](#weekly-summary).
-- **Reminder and note migration.** The `## Para recordar` and `## Apuntes diversos` blocks of the previous note are appended to dated sections in configurable Markdown files, and the most recent reminders are re-injected into today's note.
+- **Reminder and note migration.** The `## Para recordar` and `## Apuntes diversos` blocks of the previous note are appended to dated sections in configurable Markdown files, and the most recent reminders are re-injected into today's note. An Operon task among the reminders moves into today's note as the live line — identity and all, plus a `{{dateStarted::}}` when it has none — while the recorded copies (the dated file, and the previous note once the reminder has moved on) keep it as an inert `- [>]` tombstone.
 - **Archiving.** Old daily notes are moved to a configurable archive folder (with collision checks) once the daily-note count exceeds a limit.
 - **Automatic mode.** When today's daily note is created with the managed markers, consolidation and migration run on their own — once per day, no command needed. Can be toggled off.
 - **Safety first.** Manual runs offer preview and confirmation; every write re-reads the file just before modifying it; a task is never removed from its source unless it was inserted into today's note first; all operations are idempotent.
@@ -111,7 +111,7 @@ Design decisions worth knowing:
 - **Your content wins.** Emptying happens only for a placeholder (its heading and blank lines). A summary already written, or any text you put in the block yourself, is never emptied and never overwritten.
 - **Before the move, on purpose.** On the automatic path the summary is built *before* consolidation, because consolidation moves the pending tasks out of the previous week's notes; reading them afterwards would report "no pending tasks" for a week that did leave some open.
 - **Completed tasks stay where they were ticked.** They are never moved, so a completed line is read from whichever note holds it, and the note is reported when it differs from the task's `✅` stamp — e.g. `(✅ 2026-09-04 · en 2026-09-02)`.
-- **De-duplicated by text.** The same task carried forward through several notes of the week is reported once. Without this, legacy weeks inflated by ~40 %, because the old workflow copied tasks forward and marked the source with `[>]`.
+- **De-duplicated by text.** The same task carried forward through several notes of the week is reported once. Without this, legacy weeks inflated by ~40 %, because the old workflow copied tasks forward and marked the source with `[>]` — which is also what this plugin leaves behind.
 - **Both conventions are read.** Modern notes (this plugin's marker blocks) and legacy notes: no markers, `- [>]` meaning "already carried forward" (still pending) and `## Tareas canceladas` used as a dumping ground for `[x]` completions. A `[x]` is always a completed task, never a cancelled one.
 - **Undated lines are labelled as such.** A `[x]` with no `✅` stamp is reported `(sin fecha · en <note>)` instead of being silently counted as done that week.
 
@@ -132,8 +132,8 @@ The manual commands have no week gate (you asked for it): they write the summary
 | Weekly summary language | `es` | Language of the summary text (`es` / `en`). Task lines are copied verbatim. |
 | Run automatically when today's note is created | on | Run migration + consolidation once per day when today's note is created with markers. |
 | Include cancelled tasks | on | Carry `- [-]` tasks into today's cancelled block. Completed tasks are never moved. |
-| Task tag | `#task` | Tag appended to migrated pending task lines that do not carry it yet. Empty = add no tag. |
-| Stamp created date on plain tasks | on | Append ` ➕ YYYY-MM-DD` (the date of the daily note the task came from) to migrated pending tasks that have no Operon metadata and no ` ➕` date yet. Operon tasks and lines that already carry a ` ➕` date are left untouched. |
+| Task tag | `#task` | Tag appended to migrated *plain* task lines that do not carry it yet. Operon tasks are never tagged. Empty = add no tag. |
+| Carry the source date onto migrated tasks | on | Record the day a migrated task came from on the line carried into today's note: a plain task gets ` ➕ YYYY-MM-DD` (unless it already has a ` ➕` date) and an Operon task with no start date gets `{{dateStarted:: YYYY-MM-DD}}`. Tasks that already carry their own date are left untouched. |
 | Migrate miscellaneous notes | on | Migrate the notes block to the notes file. |
 | Migrate reminders | on | Migrate the reminders block and re-inject recent reminders. |
 | Recent reminders | `9` | How many recent reminder lines to re-inject into today's note. |
@@ -144,6 +144,7 @@ The manual commands have no week gate (you asked for it): they write the summary
 - Preview first, then a confirmation modal before any multi-file change (manual commands).
 - Every write re-reads the file and re-verifies the marker block immediately before modifying, so a note edited between planning and applying is left untouched.
 - Today's note is written before the sources. A mid-way failure leaves a duplicate that later runs converge — never a lost task.
+- Nothing is deleted on the way out: a line that has been carried forward stays in place as `- [>]`, keeping its text as the record of what the note held. A tombstone carries no Operon metadata on purpose — one identity may live in exactly one line.
 - Operations are idempotent: running twice produces the same result (the second run finds nothing to do).
 - Automatic mode is limited to notes that carry the managed markers, runs at most once per day, and never removes a task from its source unless the insertion into today's note succeeded.
 - The weekly summary is written only into an untouched weekly block (its heading and blank lines, or nothing), so an existing summary is never overwritten.
@@ -153,7 +154,11 @@ The manual commands have no week gate (you asked for it): they write the summary
 Operon is **optional** — the plugin is a Markdown processor and works with plain checkboxes.
 
 - **Detection.** The plugin reads the live `operon` plugin instance and checks for its documented API surface (duck-typed; no npm dependency).
-- **Identity preservation.** Task lines are moved verbatim, including `operonId`, `parentTask`, dates, priorities and dependencies. Operon's Calendar, Kanban and dependency views keep referencing the same task. The plugin never generates a second `operonId`. Migration may append the managed task tag (`#task` by default) to the parent line, but never stamps a ` ➕` date onto Operon tasks — they keep their structured dates (`{{dateStarted::}}`, `{{datetimeCreated::}}`, …). Only plain Markdown tasks without their own dates receive the created-date stamp.
+- **Identity preservation.** Task lines are moved verbatim, including `operonId`, `parentTask`, dates, priorities and dependencies. Operon's Calendar, Kanban and dependency views keep referencing the same task. The plugin never generates a second `operonId`, and never copies one either:
+  - an Operon task is never tagged and never receives a ` ➕` date — its structured dates (`{{datetimeCreated::}}`, …) are its own;
+  - a migrated pending Operon task with no start date receives `{{dateStarted:: YYYY-MM-DD}}`, placed where Operon writes it, so work carried forward from an old note does not look like it was born today. A task that already has a start date is left untouched;
+  - a task's identity is its `operonId` and nothing else, so de-duplication and "already in today's note" are decided by id. A task that is already anywhere in today's note — its reminders block included — is never inserted a second time;
+  - what stays behind is a tombstone without Operon metadata, so the `operonId` is claimed by exactly one line. If an old note still holds a second copy of a task, that copy is tombstoned and today's note keeps the only live line.
 - **Index freshness.** Operon's index self-maintains from vault events, so nothing is usually needed. If you want a safety net, enable *Refresh Operon index after consolidating* to run Operon's read-only *Rebuild full index* after each consolidation.
 - **No grants required.** Only grant-free discovery is used. If Operon is absent, disabled or not ready, every Operon call degrades to a benign no-op.
 
