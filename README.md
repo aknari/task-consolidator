@@ -17,7 +17,7 @@ Works with or without [Operon](https://github.com/hasanyilmaz/operon): task meta
 - **Weekly summary.** When the first daily note of a new week is created, a report of the previous week's daily notes — pending, completed and cancelled tasks — is written into the weekly block. It is deliberately inert (no checkboxes, no task metadata, no task tag), so it is never mistaken for work to consolidate. See [Weekly summary](#weekly-summary).
 - **Reminder and note migration.** The `## Para recordar` and `## Apuntes diversos` blocks of the previous note are appended to dated sections in configurable Markdown files, and the most recent reminders are re-injected into today's note. An Operon task among the reminders moves into today's note as the live line — identity and all, plus a `{{dateStarted::}}` when it has none — while the recorded copies (the dated file, and the previous note once the reminder has moved on) keep it as an inert `- [>]` tombstone.
 - **Archiving.** Old daily notes are moved to a configurable archive folder (with collision checks) once the daily-note count exceeds a limit.
-- **Automatic mode.** When today's daily note is created with the managed markers, consolidation and migration run on their own — once per day, no command needed. Can be toggled off.
+- **Automatic mode.** When today's daily note is created with the managed markers, consolidation and migration run on their own — once per day, no command needed. It waits for the note to stop changing first, and reports instead of losing tasks if a template writes over it. Can be toggled off.
 - **Safety first.** Manual runs offer preview and confirmation; every write re-reads the file just before modifying it; a task is never removed from its source unless it was inserted into today's note first; all operations are idempotent.
 
 ## Requirements
@@ -56,6 +56,8 @@ Open the command palette (`Cmd/Ctrl+P`) and use one of:
 | `Task Consolidator: Archive old daily notes` | Move the oldest daily notes to the archive folder until the configured maximum is kept. |
 
 **Automatic mode** (on by default): when today's daily note is created *with the managed markers* — i.e. created from your template — the plugin runs the migration and consolidation for you, once per day. Notes created without markers never trigger it. Turn it off anytime with the *Run automatically when today's note is created* setting.
+
+The run waits for the note to **settle** rather than firing a fixed time after the first write: every further write pushes it back (up to a ceiling), and once it has written it waits a moment more before marking anything as moved. A new daily note is often written twice — the periodic-notes plugin applies the daily template, and a Templater file template whose rule matches the note's date applies that same template again a few seconds later — and consolidating between the two writes would put the tasks in the note only for the second write to overwrite them. If the note turns out to have been rewritten after all, the plugin marks nothing, tells you, and the previous note keeps its tasks: nothing is lost and the consolidation can simply be repeated.
 
 ## Managed blocks
 
@@ -152,6 +154,7 @@ The manual commands have no week gate (you asked for it): they write the summary
 - Nothing is deleted on the way out: a line that has been carried forward stays in place as `- [>]`, keeping its text as the record of what the note held. A tombstone carries no Operon metadata on purpose — one identity may live in exactly one line.
 - Operations are idempotent: running twice produces the same result (the second run finds nothing to do).
 - Automatic mode is limited to notes that carry the managed markers, runs at most once per day, and never removes a task from its source unless the insertion into today's note succeeded.
+- The automatic run waits for today's note to settle (4 s of quiet, and at most 40 s of waiting) before it starts, so it lands after the last writer. A short delay after the run checks once more that the note still holds what was written into it; if it does not, nothing is marked as moved, you are told, and the previous note keeps its tasks — an automatic run can therefore never be the reason a task exists nowhere.
 - The weekly summary is written only into an untouched weekly block (its heading and blank lines, or nothing), so an existing summary is never overwritten.
 
 ## Operon integration

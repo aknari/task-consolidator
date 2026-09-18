@@ -22,6 +22,7 @@ declare module "obsidian" {
   export class TAbstractFile { path: string; name: string; }
   export class TFile extends TAbstractFile { basename: string; extension: string; }
   export class Plugin {
+    constructor(app: App, manifest?: unknown);
     app: App;
     addCommand(command: { id: string; name: string; callback: () => void }): void;
     addSettingTab(tab: PluginSettingTab): void;
@@ -47,5 +48,5 @@ declare module "obsidian" {
   export class Notice { constructor(message: string); }
 }
 
-declare interface Window { moment(): { format(format: string): string }; setTimeout(callback: () => void, ms: number): number; }
+declare interface Window { moment(): { format(format: string): string }; setTimeout(callback: () => void, ms: number): number; clearTimeout(handle: number): void; }
 declare const window: Window;
