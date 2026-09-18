@@ -1,3 +1,7 @@
+---
+created: 2026-09-01T20:48
+updated: 2026-09-18T09:54
+---
 # Task Consolidator
 
 **Author:** [T. Bautista](https://github.com/aknari)
@@ -36,7 +40,8 @@ See **[INSTALL.md](INSTALL.md)** for the release, source and BRAT paths, and for
 
 ```bash
 npm install
-npm run build   # compiles and copies main.js into .obsidian/plugins/task-consolidator/
+npm run build   # compiles into dist/
+npm run deploy  # build, then copy dist/ into .obsidian/plugins/task-consolidator/
 ```
 
 ## Usage
@@ -168,7 +173,8 @@ Operon is **optional** — the plugin is a Markdown processor and works with pla
 npm install
 npm run typecheck   # tsc --noEmit
 npm test            # the weekly-summary core (no Obsidian required)
-npm run build       # bundles src/main.ts into .obsidian/plugins/task-consolidator/main.js
+npm run build       # bundles src/main.ts into dist/
+npm run deploy      # build, then copy dist/ into .obsidian/plugins/task-consolidator/
 ```
 
 The weekly engine (`src/weekly.ts`) has no Obsidian dependency on purpose: calendar maths, the reading of both note conventions, de-duplication and rendering are plain functions, so they can be tested against real notes without an app.

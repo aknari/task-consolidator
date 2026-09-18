@@ -1,3 +1,7 @@
+---
+created: 2026-09-12T19:57
+updated: 2026-09-18T09:54
+---
 # Installing Task Consolidator
 
 This plugin is not in Obsidian's community plugin list. Install it manually, from a
@@ -38,14 +42,19 @@ cd task-consolidator
 npm install
 npm run typecheck
 npm test
-npm run build
+npm run build       # bundles into dist/
+npm run deploy      # build, then copy dist/ into a vault's plugin folder
 ```
 
-`npm run build` writes `main.js` straight into `.obsidian/plugins/task-consolidator/` of
-the repository's **parent** vault. That is why the build assumes the repo lives inside a
-vault (for example `<vault>/80-support/task-consolidator/`); if you keep it elsewhere,
-copy the built `main.js` and the `manifest.json` next to it into the plugin folder by
-hand.
+`npm run build` writes into `dist/` and touches nothing else, so the build does not depend
+on where the repository sits. `npm run deploy` copies `dist/main.js` and `manifest.json`
+into a vault's plugin folder: the `../../.obsidian/plugins/task-consolidator/` of the vault
+the source lives in (`<vault>/80-support/task-consolidator/`), or, for a repository kept
+anywhere else, wherever `OBSIDIAN_PLUGIN_DIR` points:
+
+```bash
+OBSIDIAN_PLUGIN_DIR=~/my-vault/.obsidian/plugins/task-consolidator npm run deploy
+```
 
 ## Option 3 — BRAT (auto-updates)
 
