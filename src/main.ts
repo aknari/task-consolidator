@@ -10,6 +10,7 @@ import {
   tombstoneOperonLines,
   type LineOptions,
 } from "./lines";
+import { AUTO_VERIFY_MS, autoRunDelay, survivors } from "./auto-run";
 import {
   buildWeeklySummary,
   composeWeeklyBody,
@@ -106,6 +107,15 @@ type WeeklyAction =
   | { kind: "tidy" }
   | { kind: "none" };
 interface MarkerBlock { start: number; end: number; content: string; }
+
+/** Writes the automatic run defers until today's note has been verified. */
+interface DeferredRun {
+  /** Records and tombstones that belong to the source notes and the dated files. */
+  changes: Array<{ path: string; content: string }>;
+  /** Whole lines the run put into today's note, to be checked once more. */
+  lines: string[];
+}
+
 interface PlannedMove {
   /** Normalized key of the parent line, used for de-duplication. */
   key: string;
@@ -136,7 +146,14 @@ interface KindSpec {
 
 export default class TaskConsolidatorPlugin extends Plugin {
   settings: TaskConsolidatorSettings = DEFAULT_SETTINGS;
-  private autoRunPending = false;
+  /** Timer of the pending automatic run; every write to the note re-arms it. */
+  private autoTimer: number | null = null;
+  /** When the run was first armed, so the wait cannot grow without a ceiling. */
+  private autoArmedAt = 0;
+  /** True while the automatic run is in flight (it writes more than once). */
+  private autoRunning = false;
+  /** Grace period before the sources are marked; a test hook shortens it. */
+  private verifyGraceMs = AUTO_VERIFY_MS;
   private autoRanToday: string | null = null;
 
   async onload(): Promise<void> {
@@ -358,7 +375,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * first). If today's note has no cancelled block, cancelled tasks are left in
    * place instead of being lost.
    */
-  private async applyConsolidation(current: DailyNote, pending: PlannedResult, cancelled: PlannedResult, weeklyWritten = false): Promise<void> {
+  private async applyConsolidation(current: DailyNote, pending: PlannedResult, cancelled: PlannedResult, weeklyWritten = false, defer: DeferredRun | null = null): Promise<void> {
     const pendingRes = await this.applyInsertToCurrent(current, pending.moves, "pending");
     if (!pendingRes.blockFound && pending.moves.length > 0) {
       new Notice("Task Consolidator: today's tasks block was not found on re-read; nothing was changed.");
@@ -366,15 +383,27 @@ export default class TaskConsolidatorPlugin extends Plugin {
     }
     let cancelledApplied = cancelled.moves.length === 0;
     let insertedCancelled = 0;
+    let cancelledKeys: string[] = [];
     if (cancelled.moves.length > 0) {
       const cancelledRes = await this.applyInsertToCurrent(current, cancelled.moves, "cancelled");
       if (cancelledRes.blockFound) {
         cancelledApplied = true;
         insertedCancelled = cancelledRes.inserted;
+        cancelledKeys = cancelledRes.keys;
       } else {
         new Notice("Task Consolidator: today's note has no '## Tareas canceladas' block; cancelled tasks were left in place.");
       }
     }
+    // Nothing is marked as moved until the note has been given the grace period
+    // a template can take to write over it, and has been found to still hold
+    // everything this run put there. If it was rewritten in the meantime, the
+    // sources keep their tasks and the run can simply be repeated.
+    if (defer !== null && !(await this.todayHoldsInserted(current, [...pendingRes.keys, ...cancelledKeys], defer.lines))) return;
+    // The deferred material is written before the task tombstones, the order the
+    // manual path has always used: its content was planned against the sources
+    // as they were, so applying it afterwards would write that older text back
+    // over the tombstones just made.
+    if (defer !== null) await this.applyMaterialChanges(defer.changes);
     let removedPending = 0;
     for (const { note, moves } of pending.sources.values()) {
       removedPending += await this.applySourceRemoval(note, moves, current.date, "pending");
@@ -385,9 +414,29 @@ export default class TaskConsolidatorPlugin extends Plugin {
         removedCancelled += await this.applySourceRemoval(note, moves, current.date, "cancelled");
       }
     }
-    new Notice(`Task Consolidator: inserted ${pendingRes.inserted} pending and ${insertedCancelled} cancelled task(s); marked ${removedPending + removedCancelled} line(s) as moved.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
+    const inserted = pendingRes.inserted + insertedCancelled;
+    const weekly = weeklyWritten ? " A weekly summary of the previous week was written." : "";
+    new Notice(inserted === 0
+      ? `Task Consolidator: previous note material migrated.${weekly}`
+      : `Task Consolidator: inserted ${pendingRes.inserted} pending and ${insertedCancelled} cancelled task(s); marked ${removedPending + removedCancelled} line(s) as moved.${weekly}`);
     await this.reportOperonAfterChange();
     if (this.settings.autoArchive) await this.archiveOldDailyNotes();
+  }
+
+  /**
+   * Waits out the grace period and reports whether today's note still holds what
+   * the run wrote into it. A note rewritten underneath — a template applied a
+   * second time is the case this exists for — is reported to you, and the caller
+   * marks nothing as moved, so the sources keep their tasks and nothing is lost.
+   */
+  private async todayHoldsInserted(current: DailyNote, keys: string[], lines: string[]): Promise<boolean> {
+    await new Promise<void>((resolve) => { window.setTimeout(resolve, this.verifyGraceMs); });
+    const content = await this.app.vault.read(current.file);
+    const { missingKeys, missingLines } = survivors(content, keys, lines, this.taskTag());
+    if (missingKeys.length === 0 && missingLines.length === 0) return true;
+    console.info("Task Consolidator: today's note was rewritten after consolidating", { missingKeys, missingLines });
+    new Notice("Task Consolidator: today's note was rewritten while consolidating, so nothing was marked as moved and nothing is lost. Repeat the consolidation once the note has settled.");
+    return false;
   }
 
   /**
@@ -397,25 +446,27 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * insert never runs on a stale or changed note. Tasks already present in the
    * current note are skipped (they will still be removed from their source).
    */
-  private async applyInsertToCurrent(current: DailyNote, moves: PlannedMove[], kind: MoveKind): Promise<{ inserted: number; blockFound: boolean }> {
+  private async applyInsertToCurrent(current: DailyNote, moves: PlannedMove[], kind: MoveKind): Promise<{ inserted: number; blockFound: boolean; keys: string[] }> {
     const [startMarker, endMarker] = this.kindSpec(kind).insertBlock;
     const content = await this.app.vault.read(current.file);
     const block = this.findBlock(content, startMarker, endMarker);
-    if (block === null) return { inserted: 0, blockFound: false };
+    if (block === null) return { inserted: 0, blockFound: false, keys: [] };
     const lines = content.split("\n");
     const existingKeys = this.existingTaskKeys(lines, block);
     const options = this.lineOptions();
     const toInsert: string[] = [];
+    const insertedKeys: string[] = [];
     for (const move of moves) {
       if (existingKeys.has(move.key)) continue;
       existingKeys.add(move.key);
+      insertedKeys.push(move.key);
       const insertLines = move.lines.map((line, index) => (kind === "pending" && index === 0) ? prepareMigratedLine(line, move.date, options) : line);
       toInsert.push(...insertLines);
     }
-    if (toInsert.length === 0) return { inserted: 0, blockFound: true };
+    if (toInsert.length === 0) return { inserted: 0, blockFound: true, keys: [] };
     lines.splice(block.end, 0, ...toInsert);
     await this.app.vault.modify(current.file, lines.join("\n"));
-    return { inserted: toInsert.length, blockFound: true };
+    return { inserted: toInsert.length, blockFound: true, keys: insertedKeys };
   }
 
   /**
@@ -484,25 +535,37 @@ export default class TaskConsolidatorPlugin extends Plugin {
     return markedIdx.size;
   }
 
-  /** Builds the list of Markdown changes that migrate notes and reminders from
-   * the previous daily note into the dated misc files and today's note. */
-  private async buildMaterialChanges(current: DailyNote): Promise<{ changes: Array<{ path: string; content: string }>; previous: DailyNote | null; reason: string | null }> {
+  /**
+   * Builds the Markdown changes that migrate notes and reminders from the
+   * previous daily note into the dated misc files and today's note.
+   *
+   * The two groups come back apart on purpose. `intoToday` writes into today's
+   * note and has to happen first; `deferred` holds the records and the
+   * tombstones of the source notes, and the automatic path applies it only after
+   * today's note has been verified to still hold what was inserted. Marking a
+   * source as moved on the strength of a copy that a second template write has
+   * removed is how a live reminder — and the `operonId` that is the task's
+   * identity in Operon — ends up existing nowhere.
+   */
+  private async buildMaterialChanges(current: DailyNote): Promise<{ intoToday: Array<{ path: string; content: string }>; deferred: Array<{ path: string; content: string }>; lines: string[]; previous: DailyNote | null; reason: string | null }> {
     const previous = (await this.getDailyNotes()).find((note) => note.date < current.date);
-    if (previous === undefined) return { changes: [], previous: null, reason: "no previous daily note found" };
+    if (previous === undefined) return { intoToday: [], deferred: [], lines: [], previous: null, reason: "no previous daily note found" };
     const source = await this.app.vault.read(previous.file), currentContent = await this.app.vault.read(current.file);
     const errors = [...this.validateManagedBlocks(source), ...this.validateManagedBlocks(currentContent)];
-    if (errors.length > 0) return { changes: [], previous, reason: `stopped safely; ${errors.join("; ")}` };
+    if (errors.length > 0) return { intoToday: [], deferred: [], lines: [], previous, reason: `stopped safely; ${errors.join("; ")}` };
     const sourceNotes = this.findBlock(source, this.settings.notesMarkerStart, this.settings.notesMarkerEnd);
     const sourceReminders = this.findBlock(source, this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd);
     const currentReminders = this.findBlock(currentContent, this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd);
-    const changes: Array<{ path: string; content: string }> = [];
+    const intoToday: Array<{ path: string; content: string }> = [];
+    const deferred: Array<{ path: string; content: string }> = [];
+    const lines: string[] = [];
     // A recorded copy never holds a live Operon task: the dated files, and the
     // previous note once its reminder has moved on, keep their Operon lines as
     // tombstones, so one `operonId` is never claimed twice. The copy someone
     // keeps working with is the live one — today's note for a reminder, the
     // source note itself for a miscellaneous note, which has no other home.
     if (this.settings.migrateNotes && sourceNotes?.content.trim()) {
-      changes.push({ path: this.settings.notesFile, content: await this.appendDatedBlock(this.settings.notesFile, "Notes", previous.date, tombstoneOperonLines(sourceNotes.content)) });
+      deferred.push({ path: this.settings.notesFile, content: await this.appendDatedBlock(this.settings.notesFile, "Notes", previous.date, tombstoneOperonLines(sourceNotes.content)) });
     }
     if (this.settings.migrateReminders && sourceReminders?.content.trim()) {
       // The dated marker is this migration's own record that the previous note
@@ -512,8 +575,8 @@ export default class TaskConsolidatorPlugin extends Plugin {
       // is the one way this could lose a task.
       const archive = this.app.vault.getAbstractFileByPath(this.settings.remindersFile);
       const archiveContent = archive instanceof TFile ? await this.app.vault.read(archive) : "";
-      if (archiveContent.includes(this.datedMarker("Reminders", previous.date))) return { changes, previous, reason: null };
-      changes.push({ path: this.settings.remindersFile, content: await this.appendDatedBlock(this.settings.remindersFile, "Reminders", previous.date, tombstoneOperonLines(sourceReminders.content)) });
+      if (archiveContent.includes(this.datedMarker("Reminders", previous.date))) return { intoToday, deferred, lines, previous, reason: null };
+      deferred.push({ path: this.settings.remindersFile, content: await this.appendDatedBlock(this.settings.remindersFile, "Reminders", previous.date, tombstoneOperonLines(sourceReminders.content)) });
       // What today's note receives is live material only: a line already marked
       // as carried forward is a record, not a reminder, and re-inserting it
       // would put the tombstone in the place the live task used to be.
@@ -522,14 +585,16 @@ export default class TaskConsolidatorPlugin extends Plugin {
         .slice(0, this.settings.recentReminders)
         .map((line) => (this.settings.stampCreatedDate ? stampOperonStart(line, previous.date) : line));
       if (currentReminders !== null && live.length > 0) {
-        const lines = currentContent.split("\n");
-        lines.splice(currentReminders.start + 1, currentReminders.end - currentReminders.start - 1, ...live);
-        changes.push({ path: current.file.path, content: lines.join("\n") });
+        const noteLines = currentContent.split("\n");
+        const already = new Set(currentReminders.content.split("\n").map((line) => line.trim()));
+        lines.push(...live.filter((line) => !already.has(line.trim())));
+        noteLines.splice(currentReminders.start + 1, currentReminders.end - currentReminders.start - 1, ...live);
+        intoToday.push({ path: current.file.path, content: noteLines.join("\n") });
       }
       const tombstoned = this.tombstoneOperonBlock(source, sourceReminders);
-      if (tombstoned !== null) changes.push({ path: previous.file.path, content: tombstoned });
+      if (tombstoned !== null) deferred.push({ path: previous.file.path, content: tombstoned });
     }
-    return { changes, previous, reason: null };
+    return { intoToday, deferred, lines, previous, reason: null };
   }
 
   /**
@@ -658,8 +723,12 @@ export default class TaskConsolidatorPlugin extends Plugin {
   private async migratePreviousMaterial(): Promise<void> {
     const current = await this.currentDailyNote();
     if (current === null) { new Notice("Task Consolidator: today's daily note was not found."); return; }
-    const { changes, previous, reason } = await this.buildMaterialChanges(current);
+    const material = await this.buildMaterialChanges(current);
+    const { previous, reason } = material;
     if (reason !== null) { new Notice(`Task Consolidator: ${reason}`); return; }
+    // The manual command applies everything at once: you asked for it, and no
+    // automatic run is in flight that a template could be racing with.
+    const changes = [...material.intoToday, ...material.deferred];
     if (changes.length === 0) { new Notice("Task Consolidator: no notes or reminders to migrate."); return; }
     new ConfirmationModal(this.app, `Apply ${changes.length} Markdown change(s) from ${previous!.date}?`, async () => {
       await this.applyMaterialChanges(changes);
@@ -676,6 +745,13 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * tasks move, so the previous week's pending work is still where it was.
    * Every sub-operation re-reads its files and is idempotent, so even a repeated
    * run converges to the same result.
+   *
+   * Only today's note is written here. The records, the tombstones and the
+   * "moved" markers wait until the note has been verified to still hold what was
+   * inserted (see applyConsolidation): the daily note is written twice when both
+   * the periodic-notes plugin and a Templater file template apply the daily
+   * template, and marking a source on the strength of a copy that a second write
+   * removed is how a task ends up with no live copy anywhere.
    */
   private async runAutomaticConsolidation(): Promise<void> {
     const current = await this.currentDailyNote();
@@ -685,37 +761,59 @@ export default class TaskConsolidatorPlugin extends Plugin {
       console.info("Task Consolidator: automatic run skipped; managed markers missing.");
       return;
     }
-    await this.applyMaterialChanges((await this.buildMaterialChanges(current)).changes);
+    const material = await this.buildMaterialChanges(current);
+    await this.applyMaterialChanges(material.intoToday);
     const weeklyWritten = await this.maybeWriteWeeklySummary(current, true);
     const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
     const pending = await this.planMoves(notes, "pending");
     const cancelled = this.settings.includeCancelled ? await this.planMoves(notes, "cancelled") : this.emptyResult();
-    if (pending.moves.length === 0 && cancelled.moves.length === 0) {
-      new Notice(`Task Consolidator: automatic run finished; no pending or cancelled tasks to move.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
+    if (pending.moves.length === 0 && cancelled.moves.length === 0 && material.intoToday.length === 0) {
+      new Notice(`Task Consolidator: automatic run finished; nothing to migrate or consolidate.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
       return;
     }
-    await this.applyConsolidation(current, pending, cancelled, weeklyWritten);
+    await this.applyConsolidation(current, pending, cancelled, weeklyWritten, { changes: material.deferred, lines: material.lines });
   }
 
   /**
-   * Vault-event guard: only reacts to the today's daily note, only when the
-   * managed markers are already present (i.e. the template has been applied),
-   * and only once per day. A short delay lets Templater finish writing before
-   * the consolidation re-reads the note.
+   * Vault-event guard: only reacts to today's daily note, only when the managed
+   * markers are already present (i.e. the template has been applied), and only
+   * once per day.
+   *
+   * The run is not scheduled a fixed time after the first event: every further
+   * write to the note pushes it back, so it lands after the last writer. A daily
+   * note is normally written more than once — the periodic-notes plugin applies
+   * the daily template, and a Templater file template whose regex matches the
+   * note's path applies that same template again a few seconds later — and
+   * consolidating between the two writes is how the note ends up overwritten
+   * after having been consolidated. The wait has a ceiling, so a note you are
+   * typing in cannot postpone the run forever.
    */
   private async maybeAutoConsolidate(file: TFile): Promise<void> {
-    if (!this.settings.autoConsolidate || this.autoRunPending || file.extension !== "md") return;
+    if (!this.settings.autoConsolidate || this.autoRunning || file.extension !== "md") return;
     const today = window.moment().format("YYYY-MM-DD");
     if (this.autoRanToday === today) return;
     const current = await this.currentDailyNote();
     if (current === null || file.path !== current.file.path) return;
     const content = await this.app.vault.read(file);
     if (this.validateManagedBlocks(content).length > 0) return;
-    this.autoRunPending = true;
-    this.autoRanToday = today;
-    window.setTimeout(() => {
-      this.runAutomaticConsolidation().catch((error) => console.error("Task Consolidator: automatic run failed", error)).finally(() => { this.autoRunPending = false; });
-    }, 2000);
+    this.armAutoRun(today);
+  }
+
+  /** Arms the automatic run for when today's note has been quiet long enough. */
+  private armAutoRun(today: string): void {
+    const now = Date.now();
+    if (this.autoArmedAt === 0) this.autoArmedAt = now;
+    const delay = autoRunDelay(this.autoArmedAt, now);
+    if (this.autoTimer !== null) window.clearTimeout(this.autoTimer);
+    this.autoTimer = window.setTimeout(() => {
+      this.autoTimer = null;
+      this.autoArmedAt = 0;
+      this.autoRanToday = today;
+      this.autoRunning = true;
+      this.runAutomaticConsolidation()
+        .catch((error) => console.error("Task Consolidator: automatic run failed", error))
+        .finally(() => { this.autoRunning = false; });
+    }, delay);
   }
 
   /**

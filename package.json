@@ -1,14 +1,16 @@
 {
   "name": "task-consolidator",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "scripts": {
     "build": "esbuild src/main.ts --bundle --external:obsidian --format=cjs --platform=browser --target=es2020 --outfile=dist/main.js",
     "deploy": "npm run build && cp dist/main.js manifest.json \"${OBSIDIAN_PLUGIN_DIR:-../../.obsidian/plugins/task-consolidator}/\"",
     "typecheck": "tsc --noEmit",
-    "test": "npm run test:weekly && npm run test:lines",
+    "test": "npm run test:weekly && npm run test:lines && npm run test:auto && npm run test:integration",
     "test:weekly": "esbuild test/weekly.test.ts --bundle --platform=node --format=cjs --outfile=.test/weekly.test.cjs && node .test/weekly.test.cjs",
-    "test:lines": "esbuild test/lines.test.ts --bundle --platform=node --format=cjs --outfile=.test/lines.test.cjs && node .test/lines.test.cjs"
+    "test:lines": "esbuild test/lines.test.ts --bundle --platform=node --format=cjs --outfile=.test/lines.test.cjs && node .test/lines.test.cjs",
+    "test:auto": "esbuild test/auto-run.test.ts --bundle --platform=node --format=cjs --outfile=.test/auto-run.test.cjs && node .test/auto-run.test.cjs",
+    "test:integration": "esbuild test/auto-run-integration.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=.test/auto-run-integration.test.cjs && node .test/auto-run-integration.test.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
