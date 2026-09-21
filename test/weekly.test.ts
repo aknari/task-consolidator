@@ -4,8 +4,11 @@
  * The cases that matter are the ones that make the summary *honest*:
  *  - a `[x]` line is a completed task in both conventions, even though the
  *    legacy script parked them in `## Tareas canceladas`;
- *  - `[>]` is the legacy "already carried forward" mark, so it is pending;
- *  - the same task carried through several notes of a week is reported once;
+ *  - `[>]` is the "already carried forward" tombstone both conventions leave,
+ *    so it is history, not a state: it decides only when no real mark of the
+ *    week survives for that task, and then its block says how the work left;
+ *  - the same task carried through several notes of a week is reported once,
+ *    described by the last mark that really states something about it;
  *  - and nothing the renderer emits can be mistaken for a task: no checkbox,
  *    no `{{...}}` metadata (which would duplicate an Operon id) and no tag.
  */
@@ -167,6 +170,102 @@ check(
 // The legacy script left the same task in both notes, so 'Pending' would
 // otherwise be inflated by ~40%: 18 raw records were 11 distinct tasks.
 check('no inflation from copied-forward lines', readWeeklyTasks(GROUP, READ).length, 2);
+
+// --------------------------------------------------------------------------
+// Which occurrence of a task describes it
+// --------------------------------------------------------------------------
+// The bug these cases exist for: a task pending earlier in the week and ticked
+// later. Every move leaves `[>]` behind in the source notes, and reading the
+// *first* occurrence reported a finished task as pending — while 'Completadas'
+// stayed empty. A real mark is what the task's state is; a tombstone is not.
+const TICKED_LATER: WeeklyNoteInput[] = [
+  {
+    date: '2026-09-16',
+    content: [
+      MARKERS.tasksStart,
+      '- [>] Pedir el documento de Toma de Posesión tras el reingreso al servicio activo #ulpgc #task ➕ 2026-09-04',
+      MARKERS.tasksEnd,
+    ].join('\n'),
+  },
+  {
+    date: '2026-09-17',
+    content: [
+      MARKERS.tasksStart,
+      '- [>] Pasar palabras al #amawal del chat y otras #task ➕ 2024-12-17',
+      '- [x] Pedir el documento de Toma de Posesión tras el reingreso al servicio activo #ulpgc #task ➕ 2026-09-04 ✅ 2026-09-17',
+      MARKERS.tasksEnd,
+    ].join('\n'),
+  },
+  {
+    date: '2026-09-18',
+    content: [MARKERS.tasksStart, '- [>] Pasar palabras al #amawal del chat y otras #task ➕ 2024-12-17', MARKERS.tasksEnd].join('\n'),
+  },
+];
+check(
+  'a task ticked later in the week is completed, not pending',
+  readWeeklyTasks(TICKED_LATER, READ)
+    .map((t) => [t.state, t.text, t.completed])
+    .sort(),
+  [
+    ['completed', 'Pedir el documento de Toma de Posesión tras el reingreso al servicio activo #ulpgc', '2026-09-17'],
+    ['pending', 'Pasar palabras al #amawal del chat y otras', null],
+  ].sort(),
+);
+const tickedOut = buildWeeklySummary(TICKED_LATER, RENDER).join('\n');
+check(
+  'the report files it under Completed',
+  tickedOut.includes('**Completadas (1)**\n- Pedir el documento de Toma de Posesión tras el reingreso al servicio activo #ulpgc (✅ 2026-09-17)'),
+  true,
+);
+check(
+  'the report leaves it out of Pending',
+  tickedOut.includes('**Pendientes (1)**\n- Pasar palabras al #amawal del chat y otras (➕ 2024-12-17)'),
+  true,
+);
+
+// A cancelled task leaves the same `[>]` behind, and its tombstone can outlive
+// every real mark of the week: the block it was carried out of is what says it
+// left as cancelled, not as open work.
+// (The tasks marker pair has to be there too: with only one half of the
+// convention present the reader falls back to the legacy heading rules.)
+const cancelled = (date: string, lines: string[]): WeeklyNoteInput => ({
+  date,
+  content: [
+    '## Plan del día',
+    MARKERS.tasksStart,
+    '## Tareas pendientes',
+    MARKERS.tasksEnd,
+    '## Tareas canceladas',
+    MARKERS.cancelledStart,
+    ...lines,
+    MARKERS.cancelledEnd,
+  ].join('\n'),
+});
+const CANCELLED_CARRIED: WeeklyNoteInput[] = [
+  cancelled('2026-09-16', ['- [>] Comprar desodorante en roll-on y gel #task ➕ 2025-09-15']),
+  cancelled('2026-09-17', ['- [>] Comprar desodorante en roll-on y gel #task ➕ 2025-09-15']),
+];
+check('a cancelled task carried out of the week stays cancelled', readWeeklyTasks(CANCELLED_CARRIED, READ).map((t) => t.state), ['cancelled']);
+
+// The real mark survives a later tombstone: cancelled, carried forward, and the
+// source keeps the tombstone.
+const CANCELLED_THEN_TOMBSTONED: WeeklyNoteInput[] = [
+  cancelled('2026-09-16', ['- [-] Descartado el miércoles #task']),
+  cancelled('2026-09-17', ['- [>] Descartado el miércoles #task']),
+];
+check(
+  'a later tombstone does not overwrite the cancellation',
+  readWeeklyTasks(CANCELLED_THEN_TOMBSTONED, READ).map((t) => t.state),
+  ['cancelled'],
+);
+
+// And the same rule the other way: work written again after it was ticked is
+// open again, never hidden under its earlier completion.
+const WRITTEN_AGAIN: WeeklyNoteInput[] = [
+  { date: '2026-09-16', content: [MARKERS.tasksStart, '- [x] Regar las plantas #task ➕ 2026-09-16 ✅ 2026-09-16', MARKERS.tasksEnd].join('\n') },
+  { date: '2026-09-18', content: [MARKERS.tasksStart, '- [ ] Regar las plantas #task ➕ 2026-09-18', MARKERS.tasksEnd].join('\n') },
+];
+check('a task written again later is pending again', readWeeklyTasks(WRITTEN_AGAIN, READ).map((t) => t.state), ['pending']);
 
 // --------------------------------------------------------------------------
 // Ordering and the cap

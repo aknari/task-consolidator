@@ -17,6 +17,16 @@
  *    rewritten as `[>]` in the source note, and anything that was not pending
  *    — including `[x]` completed tasks — was swept into `## Tareas canceladas`.
  *
+ * Both of them leave the same mark behind when a line is carried forward:
+ * `- [>]`. That mark says *the line moved*, not what became of the work, so it
+ * is history rather than a state. A task's state is therefore taken from the
+ * last mark that truly states one — `[ ]`, `[!]`, `[x]`, `[-]`: a task is
+ * ticked, dropped or left open where it stood, and that line never moves again,
+ * so the last such mark is the most recent word on it. A `[>]` decides only
+ * when the week holds no real mark at all, and then its block is what speaks:
+ * carried out of the tasks block it left as pending, out of the carry-forward
+ * block it left as cancelled.
+ *
  * Everything this module renders is deliberately **inert**: no checkbox, no
  * `{{...}}` metadata and no managed task tag. Three reasons:
  *
@@ -188,10 +198,39 @@ function zonesOf(content: string, markers: WeeklyMarkers): Array<{ zone: Zone; l
 function stateOf(mark: string, zone: Zone): WeeklyTaskState | null {
   if (mark === "x" || mark === "X") return "completed";
   if (mark === "-" || mark === "/") return "cancelled";
-  // `[ ]`, `[!]` (important) and the legacy `[>]` (already carried forward).
-  if (mark === " " || mark === "!" || mark === ">") return "pending";
+  // `[ ]` and `[!]` (important) are real states: work standing open.
+  if (mark === " " || mark === "!") return "pending";
+  // `[>]` is the tombstone both conventions leave, so it states nothing of its
+  // own: its block does. A line carried out of the tasks block left as pending,
+  // one carried out of the carry-forward block left as cancelled. It is only
+  // used when the week holds no real mark for the task (see combine()).
+  if (mark === ">") return zone === "cancelled" ? "cancelled" : "pending";
   // Anything else (`[?]`, a stray emoji, …) is not a state we can vouch for.
   return null;
+}
+
+/**
+ * One task line as read from one note, plus whether it is a tombstone.
+ *
+ * A real state (`[ ]`, `[!]`, `[x]`, `[-]`) is something a note says about the
+ * work itself; a tombstone (`[>]`) only says the line moved on from there.
+ */
+interface Occurrence extends WeeklyTask {
+  tombstone: boolean;
+}
+
+/**
+ * Combines two occurrences of one task, in ascending note order.
+ *
+ * A real mark wins over a tombstone however late the tombstone is: what became
+ * of the work survives where it was ticked, dropped or left open, while the
+ * tombstone is only what the source kept. Between two tombstones — and between
+ * two real marks — the later one wins, because that is where the task was last
+ * carried from, or the last thing actually decided about it.
+ */
+function combine(current: Occurrence, candidate: Occurrence): Occurrence {
+  if (current.tombstone !== candidate.tombstone) return current.tombstone ? candidate : current;
+  return candidate;
 }
 
 /** Strips the parts that must never be re-emitted, keeping the text readable. */
@@ -229,10 +268,12 @@ export function dedupeKey(text: string): string {
 /**
  * Reads every task line of the given notes (expected in ascending date order)
  * and returns them de-duplicated by text, so a task carried forward through
- * several notes of the same week is reported once.
+ * several notes of the same week is reported once. Which occurrence describes
+ * the task is decided by `combine`: the state of a task is the last one really
+ * written down, never the `[>]` tombstones the moves leave behind.
  */
 export function readWeeklyTasks(notes: WeeklyNoteInput[], options: WeeklyReadOptions): WeeklyTask[] {
-  const tasks: WeeklyTask[] = [];
+  const tasks: Occurrence[] = [];
   for (const note of notes) {
     // Parent level only: whatever is indented deeper than the shallowest task
     // line of its zone is that zone's subtask, not a task of its own. The
@@ -258,17 +299,25 @@ export function readWeeklyTasks(notes: WeeklyNoteInput[], options: WeeklyReadOpt
         const text = toInertText(raw, options.taskTag);
         if (text === "") continue;
         const { created, completed } = datesOf(raw);
-        tasks.push({ state, text, created, completed, note: note.date });
+        tasks.push({ state, text, created, completed, note: note.date, tombstone: match[2] === ">" });
       }
     }
   }
-  const seen = new Set<string>();
-  return tasks.filter((task) => {
+  const byKey = new Map<string, Occurrence>();
+  for (const task of tasks) {
     const key = dedupeKey(task.text);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    const current = byKey.get(key);
+    // Re-setting an existing key keeps its original position, so the returned
+    // list is still in reading order.
+    byKey.set(key, current === undefined ? task : combine(current, task));
+  }
+  return [...byKey.values()].map((task) => ({
+    state: task.state,
+    text: task.text,
+    created: task.created,
+    completed: task.completed,
+    note: task.note,
+  }));
 }
 
 const byDate = (task: WeeklyTask, key: "created" | "completed"): string =>
