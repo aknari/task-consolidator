@@ -12,7 +12,12 @@
  *  - a migrated plain task is decorated, a migrated Operon task is not — it
  *    only receives the start date it lacks;
  *  - what is left behind is `- [>]` with no Operon metadata, because a
- *    tombstone keeping an `operonId` claims an identity today's note holds.
+ *    tombstone keeping an `operonId` claims an identity today's note holds;
+ *  - a task planned for the day it is leaving arrives without that scheduling,
+ *    in every notation the ruler writes (including a bare `h:mm` prefix, whose
+ *    day is the day of the note it came from), while one planned for today or
+ *    later keeps it, and the tombstone keeps it all as the record. The fixtures
+ *    of that section are the user's own lines.
  */
 import assert from 'node:assert/strict';
 import {
@@ -22,7 +27,10 @@ import {
   normalizeTaskLine,
   operonId,
   prepareMigratedLine,
+  scheduledDate,
   stampOperonStart,
+  stripPastSchedule,
+  stripSchedule,
   taskKey,
   tombstoneLine,
   tombstoneOperonLines,
@@ -180,6 +188,140 @@ check(
     ['- [ ] Pedir cita en Ars Medica', OPERON, 'En /home/bautista/misc hay algo'].join('\n'),
   ),
   ['- [ ] Pedir cita en Ars Medica', '- [>] Descargar las transparencias de Ingeniería de Sistemas de Instrumentación', 'En /home/bautista/misc hay algo'].join('\n'),
+);
+
+// --------------------------------------------------------------------------
+// Leaving a past day's scheduling behind
+// --------------------------------------------------------------------------
+const TARGET = '2026-10-16';
+const SOURCE = '2026-10-15';
+// The three lines of the vault note this was reported from, verbatim.
+const MIGRATED_TIME = '- [ ] 11:20 - 12:00 Revisión de cálculos previos P3 #materia/principios-electronica #task ⏳ 2026-10-14 ➕ 2026-10-13';
+const MIGRATED_EMPTY_TITLE = '- [ ] 14:00 - 14:30 #materia/sistemas-instrumentacion #task ⏳ 2026-10-14 ➕ 2026-10-13';
+const ALREADY_TODAY = '- [ ] 12:00 - 12:30 Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14';
+
+check('the scheduling date is read from the Tasks emoji', scheduledDate('- [ ] X ⏳ 2026-10-14'), '2026-10-14');
+check('the scheduling date is read from the Dataview field', scheduledDate('- [ ] X [scheduled:: 2026-10-14T11:20]'), '2026-10-14');
+check('the scheduling date is read from the Kanban braces', scheduledDate('- [ ] X @{2026-10-14} @@{09:00}'), '2026-10-14');
+check('a bare h:mm prefix is no date on its own', scheduledDate('- [ ] 12:00 - 12:30 Revisión de informes P2'), null);
+check(
+  'a bare h:mm prefix means the day of the note it lives in',
+  scheduledDate('- [ ] 12:00 - 12:30 Revisión de informes P2', SOURCE),
+  SOURCE,
+);
+check(
+  'a dated prefix carries its own date instead',
+  scheduledDate('- [ ] 2026-10-20 09:00 - 09:30 Mirar la práctica 1', SOURCE),
+  '2026-10-20',
+);
+check('a line with no scheduling has no date', scheduledDate(PLAIN), null);
+
+check(
+  'yesterday`s time survives, its pin to yesterday does not',
+  stripPastSchedule(MIGRATED_TIME, TARGET),
+  '- [ ] Revisión de cálculos previos P3 #materia/principios-electronica #task ➕ 2026-10-13',
+);
+check(
+  'a line whose text was all scheduling keeps its tags and ➕ date',
+  stripPastSchedule(MIGRATED_EMPTY_TITLE, TARGET),
+  '- [ ] #materia/sistemas-instrumentacion #task ➕ 2026-10-13',
+);
+check(
+  'the Dataview fields the ruler writes go together',
+  stripPastSchedule('- [ ] X [scheduled:: 2026-10-14T11:20] [startTime:: 13:15] [duration:: 40m] [due:: 2026-10-30]', TARGET),
+  '- [ ] X [due:: 2026-10-30]',
+);
+check(
+  'the full-calendar fields go together too',
+  stripPastSchedule('- [ ] X [date:: 2026-10-14] [startTime:: 09:00] [endTime:: 9:30] [duration:: 30m] [allDay:: true]', TARGET),
+  '- [ ] X',
+);
+check('an emoji date with a time is cleared', stripPastSchedule('- [ ] X ⏳ 2026-10-14 09:00', TARGET), '- [ ] X');
+check('the Kanban date and time are cleared', stripPastSchedule('- [ ] X @{2026-10-14} @@{09:00}', TARGET), '- [ ] X');
+check(
+  'a line with no scheduling is untouched',
+  stripPastSchedule('- [ ] Mirar la práctica 1 #task', TARGET, SOURCE),
+  '- [ ] Mirar la práctica 1 #task',
+);
+check(
+  'a prefix planned for the day it is leaving goes with the rest',
+  stripPastSchedule(ALREADY_TODAY, TARGET, SOURCE),
+  '- [ ] Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14',
+);
+check(
+  'a prefix of a day that is still ahead stays',
+  stripPastSchedule('- [ ] 2026-10-20 09:00 - 09:30 Mirar la práctica 1', TARGET, SOURCE),
+  '- [ ] 2026-10-20 09:00 - 09:30 Mirar la práctica 1',
+);
+check(
+  'a prefix whose day is unknown is left alone rather than guessed at',
+  stripPastSchedule(ALREADY_TODAY, TARGET),
+  ALREADY_TODAY,
+);
+check(
+  'scheduling that is still ahead is kept',
+  stripPastSchedule('- [ ] X ⏳ 2026-10-20', TARGET),
+  '- [ ] X ⏳ 2026-10-20',
+);
+check(
+  'scheduling for the destination day itself is kept',
+  stripPastSchedule('- [ ] X [scheduled:: 2026-10-16T08:00]', TARGET),
+  '- [ ] X [scheduled:: 2026-10-16T08:00]',
+);
+check(
+  'a date this helper cannot read is never guessed at',
+  stripPastSchedule('- [ ] X [scheduled:: ayer]', TARGET),
+  '- [ ] X [scheduled:: ayer]',
+);
+check(
+  "Operon's own date is not this plugin's to clear",
+  stripPastSchedule('- [ ] X {{operonId:: gmucqjc}} {{dateScheduled:: 2026-10-01}} ⏳ 2026-10-14', TARGET),
+  '- [ ] X {{operonId:: gmucqjc}} {{dateScheduled:: 2026-10-01}}',
+);
+check(
+  'a due date and a start date are not scheduling',
+  stripPastSchedule('- [ ] X 📅 2026-09-01 [start:: 2026-09-01] ⏳ 2026-10-14', TARGET),
+  '- [ ] X 📅 2026-09-01 [start:: 2026-09-01]',
+);
+check(
+  'clearing twice changes nothing',
+  stripSchedule(stripSchedule('- [ ] X ⏳ 2026-10-14 [duration:: 40m]')),
+  '- [ ] X',
+);
+check(
+  'a migrated pending line arrives unscheduled and decorated once',
+  prepareMigratedLine(MIGRATED_TIME, SOURCE, OPTIONS, TARGET),
+  '- [ ] Revisión de cálculos previos P3 #materia/principios-electronica #task ➕ 2026-10-13',
+);
+check(
+  'the ➕ stamp of the day it came from is added when the line has none',
+  prepareMigratedLine('- [ ] Mirar la práctica 1 ⏳ 2026-10-14', SOURCE, OPTIONS, TARGET),
+  '- [ ] Mirar la práctica 1 #task ➕ 2026-10-15',
+);
+check(
+  'the setting turns the clearing off',
+  prepareMigratedLine('- [ ] Mirar la práctica 1 ⏳ 2026-10-14', SOURCE, { ...OPTIONS, clearPastSchedule: false }, TARGET),
+  '- [ ] Mirar la práctica 1 ⏳ 2026-10-14 #task ➕ 2026-10-15',
+);
+check(
+  'without a destination date the line is only decorated',
+  prepareMigratedLine('- [ ] Mirar la práctica 1 ⏳ 2026-10-14', SOURCE, OPTIONS),
+  '- [ ] Mirar la práctica 1 ⏳ 2026-10-14 #task ➕ 2026-10-15',
+);
+check(
+  'a migrated line with a prefix arrives cleared too',
+  prepareMigratedLine(ALREADY_TODAY, SOURCE, OPTIONS, TARGET),
+  '- [ ] Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14',
+);
+check(
+  'the tombstone left in the source note keeps the record',
+  tombstoneLine(MIGRATED_TIME),
+  '- [>] 11:20 - 12:00 Revisión de cálculos previos P3 #materia/principios-electronica #task ⏳ 2026-10-14 ➕ 2026-10-13',
+);
+check(
+  'a prefix-only tombstone keeps its hour as well',
+  tombstoneLine(ALREADY_TODAY),
+  '- [>] 12:00 - 12:30 Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14',
 );
 
 if (failed > 0) {

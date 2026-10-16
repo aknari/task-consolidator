@@ -5,6 +5,7 @@ import {
   normalizeTaskLine,
   prepareMigratedLine,
   stampOperonStart,
+  stripPastSchedule,
   taskKey,
   tombstoneLine,
   tombstoneOperonLines,
@@ -35,6 +36,7 @@ interface TaskConsolidatorSettings {
   includeCancelled: boolean;
   taskTag: string;
   stampCreatedDate: boolean;
+  clearPastSchedule: boolean;
   migrateNotes: boolean;
   migrateReminders: boolean;
   recentReminders: number;
@@ -78,6 +80,7 @@ const DEFAULT_SETTINGS: TaskConsolidatorSettings = {
   includeCancelled: true,
   taskTag: "#task",
   stampCreatedDate: true,
+  clearPastSchedule: true,
   migrateNotes: true,
   migrateReminders: true,
   recentReminders: 9,
@@ -217,7 +220,23 @@ export default class TaskConsolidatorPlugin extends Plugin {
 
   /** Options the line helpers need, taken from this plugin's settings. */
   private lineOptions(): LineOptions {
-    return { taskTag: this.taskTag(), stampCreatedDate: this.settings.stampCreatedDate };
+    return {
+      taskTag: this.taskTag(),
+      stampCreatedDate: this.settings.stampCreatedDate,
+      clearPastSchedule: this.settings.clearPastSchedule,
+    };
+  }
+
+  /**
+   * The key a line has once it lives in the note dated `targetDate`. Clearing
+   * the scheduling of an earlier day changes the line, and a key taken from the
+   * source would no longer recognise the copy this run wrote there: a second
+   * run would insert the same task again.
+   */
+  private destinationKey(line: string, targetDate: string): string {
+    const tag = this.taskTag();
+    const cleared = this.settings.clearPastSchedule ? stripPastSchedule(line, targetDate) : line;
+    return taskKey(cleared, tag);
   }
 
   private kindSpec(kind: MoveKind): KindSpec {
@@ -452,15 +471,30 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const block = this.findBlock(content, startMarker, endMarker);
     if (block === null) return { inserted: 0, blockFound: false, keys: [] };
     const lines = content.split("\n");
-    const existingKeys = this.existingTaskKeys(lines, block);
+    const existingKeys = this.existingTaskKeys(lines, block, current.date);
     const options = this.lineOptions();
     const toInsert: string[] = [];
     const insertedKeys: string[] = [];
     for (const move of moves) {
+      // The parent is prepared (state, tag, source-date stamp); an indented
+      // subtask travels verbatim except for its own scheduling of an earlier
+      // day, which would pin it to the day it is leaving just the same.
+      const insertLines = move.lines.map((line, index) => {
+        if (kind !== "pending") return line;
+        if (index === 0) return prepareMigratedLine(line, move.date, options, current.date);
+        return options.clearPastSchedule !== false ? stripPastSchedule(line, current.date, move.date) : line;
+      });
+      // A pending line is looked for under both of its forms: the planned key
+      // (as the source note holds it) and the key it will have here, because
+      // clearing a past schedule changes it. Only the planned key is recorded,
+      // though: two tasks whose text differs *only* in their scheduling are
+      // still two tasks of the source notes, and both travel — losing one to a
+      // key collision is the one thing this plugin must never do.
+      const key = kind === "pending" ? this.destinationKey(insertLines[0], current.date) : move.key;
       if (existingKeys.has(move.key)) continue;
+      if (kind === "pending" && existingKeys.has(key)) continue;
       existingKeys.add(move.key);
-      insertedKeys.push(move.key);
-      const insertLines = move.lines.map((line, index) => (kind === "pending" && index === 0) ? prepareMigratedLine(line, move.date, options) : line);
+      insertedKeys.push(key);
       toInsert.push(...insertLines);
     }
     if (toInsert.length === 0) return { inserted: 0, blockFound: true, keys: [] };
@@ -475,22 +509,43 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * task that already lives in today's note (its reminders block, its notes
    * block, its body) is never inserted a second time: two lines claiming one
    * `operonId` is the clash Operon can only resolve by hand.
+   *
+   * A line is recognised under both of its forms — as it stands and as this run
+   * would write it — so a copy left here by an earlier run (or by hand) with a
+   * stale scheduling mark still counts as present, and the same task is not
+   * inserted twice. A task whose scheduling has been cleared is not lost to
+   * that recognition either: `applyInsertToCurrent` records only the form the
+   * source note holds while inserting, so two source lines that differ in
+   * nothing but their scheduling are both carried in.
    */
-  private existingTaskKeys(lines: string[], block: MarkerBlock): Set<string> {
+  private existingTaskKeys(lines: string[], block: MarkerBlock, targetDate: string): Set<string> {
     const tag = this.taskTag();
     const keys = new Set<string>();
+    // Both forms of a line count as present: as it stands, and as this run would
+    // write it. A copy left in today's note by an earlier run (or by hand) with
+    // a stale scheduling mark is the same task, and inserting it again would
+    // duplicate it.
+    const add = (line: string): void => {
+      keys.add(taskKey(line, tag));
+      if (this.settings.clearPastSchedule) keys.add(this.destinationKey(line, targetDate));
+    };
+    // `[^]]` is not "anything but a bracket" in JavaScript: it is the any-char
+    // class followed by a literal `]`, so it matched no task line at all and
+    // this set stayed empty for every plain task. `[^\]\n]` is what was meant:
+    // one status character between the brackets.
     for (const line of lines.slice(block.start + 1, block.end)) {
-      if (/^\s*- \[[^]]+\]/.test(line)) keys.add(taskKey(line, tag));
+      if (/^\s*- \[[^\]\n]\](\s|$)/.test(line)) add(line);
     }
-    for (const line of lines) if (isOperonLine(line)) keys.add(taskKey(line, tag));
+    for (const line of lines) if (isOperonLine(line)) add(line);
     return keys;
   }
 
   /**
    * Marks the moved task lines of a kind in a source note as carried forward:
    * each one stays in place as `- [>]` — the convention the legacy notes and
-   * the old Python script already use — keeping its text as the record of what
-   * was there, and a non-destructive HTML comment says where the work went.
+   * the old Python script already use — keeping its text, its scheduling and
+   * its ➕ date as the record of what was there and how that day was planned,
+   * and a non-destructive HTML comment says where the work went.
    *
    * The tombstone drops the Operon `{{...}}` fields, and that is the point: the
    * live copy in today's note now holds that `operonId`, and a second line
@@ -881,6 +936,7 @@ class TaskConsolidatorSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Include cancelled tasks").setDesc("Move tasks marked cancelled (- [-]) from previous notes into today's '## Tareas canceladas' block. Completed tasks (- [x]) are never moved.").addToggle((toggle) => toggle.setValue(this.plugin.settings.includeCancelled).onChange(async (value) => { this.plugin.settings.includeCancelled = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Task tag").setDesc("Tag appended to migrated pending task lines that do not carry it yet (e.g. #task). Leave empty to add no tag.").addText((text) => text.setValue(this.plugin.settings.taskTag).onChange(async (value) => { this.plugin.settings.taskTag = value.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Carry the source date onto migrated tasks").setDesc("Record the day a task came from on the line carried into today's note: a plain task gets ' ➕ YYYY-MM-DD' (unless it already has a ➕ date) and an Operon task with no start date gets '{{dateStarted:: YYYY-MM-DD}}'. Tasks that already carry their own date are left untouched.").addToggle((toggle) => toggle.setValue(this.plugin.settings.stampCreatedDate).onChange(async (value) => { this.plugin.settings.stampCreatedDate = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Clear the scheduling of an earlier day").setDesc("A pending task planned for the day it is leaving keeps a mark that pins it to that day: in a time-ruler (or any Dataview) column it shows under the past day instead of today's timeline, and dragging it is the only way out. With this on, the scheduling marks of an earlier day — time-ruler's '⏳ YYYY-MM-DD', '[scheduled:: ...]', '[date:: ...]', '[startTime::]', '[endTime::]', '[allDay::]', '[duration::]', '@{...}' and the leading 'h:mm - h:mm' — are dropped from the line carried into today's note, so the task arrives unscheduled and can be planned again. A bare 'h:mm' prefix carries no date because the ruler reads it against the note it lives in, so the day it means is the day the line came from, and it is cleared like the rest. Scheduling for today or a later day, and every other field ('due', 'start', tags, links, Operon '{{...}}'), is left alone; the '- [>]' left in the source note keeps the scheduling as the record of how that day was planned.").addToggle((toggle) => toggle.setValue(this.plugin.settings.clearPastSchedule).onChange(async (value) => { this.plugin.settings.clearPastSchedule = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Migrate miscellaneous notes").addToggle((toggle) => toggle.setValue(this.plugin.settings.migrateNotes).onChange(async (value) => { this.plugin.settings.migrateNotes = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Migrate reminders").addToggle((toggle) => toggle.setValue(this.plugin.settings.migrateReminders).onChange(async (value) => { this.plugin.settings.migrateReminders = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Recent reminders").addText((text) => text.setValue(String(this.plugin.settings.recentReminders)).onChange(async (value) => { const n = Number(value); if (Number.isFinite(n) && n >= 0) { this.plugin.settings.recentReminders = Math.floor(n); await this.plugin.saveSettings(); } }));
