@@ -249,6 +249,59 @@ async function main(): Promise<void> {
     );
   }
 
+  console.log('\nThe plan of a day that is over: an open task comes back as pending');
+
+  {
+    resetNotices();
+    const vault = new MockVault();
+    const planTask = '- [ ] Tarea de prueba   [scheduled:: 2026-09-17T17:45]  [duration:: 15m]';
+    // The `simple` prefix, which is what the ruler writes when the line carries
+    // no field of its own — in the plan block as well.
+    const planPrefix = '- [ ] 09:00 - 09:30 Revisar el correo #task ➕ 2026-09-17';
+    const planPrefixDated = '- [ ] 2026-09-17 10:00 - 10:30 Llamar al banco #task';
+    vault.seed(YESTERDAY_PATH, dailyNote({ plan: [planTask, planPrefix, planPrefixDated] }));
+    vault.seed(TODAY_PATH, TEMPLATE_TODAY);
+    vault.seed(REMINDERS_FILE, '# Recordatorios\n');
+    vault.seed(NOTES_FILE, '# Apuntes\n');
+    await startRun(vault);
+
+    const today = vault.content(TODAY_PATH);
+    const backlog = section(today, BACKLOG);
+    checkTrue(
+      'a task left open in yesterday\'s plan arrives in today\'s backlog',
+      backlog.some((line) => line.includes('Tarea de prueba')),
+    );
+    checkTrue(
+      'without the slot of the day it left',
+      !backlog.join('\n').includes('17:45') && !backlog.join('\n').includes('[scheduled:: 2026-09-17'),
+    );
+    checkTrue(
+      'it is not smuggled into today\'s plan',
+      !section(today, PLAN).some((line) => line.includes('Tarea de prueba')),
+    );
+
+    const yesterday = vault.content(YESTERDAY_PATH);
+    checkTrue('yesterday\'s plan says where the work went', section(yesterday, PLAN).includes('<!-- task-consolidator:moved 3 task line(s) to 2026-09-18 -->'));
+    checkTrue(
+      'and keeps the line as a tombstone with the slot of that day',
+      section(yesterday, PLAN).some((line) => line.startsWith('- [>] Tarea de prueba') && line.includes('17:45')),
+    );
+    checkTrue(
+      'a bare h:mm - h:mm prefix in the plan is dropped on the way in',
+      backlog.includes('- [ ] Revisar el correo #task ➕ 2026-09-17') && !today.includes('09:00 - 09:30'),
+    );
+    checkTrue(
+      'a dated h:mm prefix is dropped too, date and all',
+      backlog.includes('- [ ] Llamar al banco #task ➕ 2026-09-17') && !today.includes('10:00 - 10:30') && !today.includes('2026-09-17 10:00'),
+    );
+    checkTrue(
+      'their tombstones keep the prefix, as the record of the plan',
+      section(yesterday, PLAN).some((line) => line.startsWith('- [>] 09:00 - 09:30 Revisar el correo')) &&
+        section(yesterday, PLAN).some((line) => line.startsWith('- [>] 2026-09-17 10:00 - 10:30 Llamar al banco')),
+    );
+    checkTrue('nothing was reported as lost', !notices.some((message) => message.includes('rewritten while consolidating')));
+  }
+
   console.log('\nA subtask planned for the day it is leaving');
 
   {

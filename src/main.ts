@@ -309,7 +309,14 @@ export default class TaskConsolidatorPlugin extends Plugin {
     if (kind === "pending") {
       return {
         insertBlock: [this.settings.tasksMarkerStart, this.settings.tasksMarkerEnd],
-        blocks: [[this.settings.tasksMarkerStart, this.settings.tasksMarkerEnd]],
+        // The plan block too: a task planned for a day that is over and left
+        // open is pending work, and nothing else would carry it forward — the
+        // reconcile rule keeps it in the plan of the note it was planned for,
+        // so skipping the plan block here would leave it stranded there.
+        blocks: [
+          [this.settings.tasksMarkerStart, this.settings.tasksMarkerEnd],
+          [this.settings.planMarkerStart, this.settings.planMarkerEnd],
+        ],
         isTarget: (line) => /^\s*- \[ \]/.test(line) || /^\s*- \[!\]/.test(line),
         otherClaimed: (line) => /^\s*- \[-\]/.test(line),
         comment: "task line(s)",
@@ -655,28 +662,38 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const content = await this.app.vault.read(note.file);
     const lines = content.split("\n");
     const markedIdx = new Set<number>();
+    // One comment per block, with the lines marked *there*: a note can now
+    // carry lines out of both the backlog and the plan, and a single comment
+    // with the total would sit in one of them describing the other.
+    const comments: Array<{ at: number; count: number }> = [];
     for (const [startMarker, endMarker] of spec.blocks) {
       const block = this.findBlock(content, startMarker, endMarker);
       if (block === null) continue;
+      const inBlock = new Set<number>();
       for (const move of moves) {
         for (let k = block.start + 1; k < block.end; k += 1) {
           if (markedIdx.has(k) || taskKey(lines[k], tag) !== move.key) continue;
           const indent = lines[k].match(/^\s*/)?.[0].length ?? 0;
           markedIdx.add(k);
+          inBlock.add(k);
           let j = k + 1;
           while (j < block.end) {
             const child = lines[j];
             const childIndent = child.match(/^\s*/)?.[0].length ?? 0;
             if (!/^\s*- \[/.test(child) || childIndent <= indent) break;
             markedIdx.add(j);
+            inBlock.add(j);
             j += 1;
           }
         }
       }
+      if (inBlock.size > 0) comments.push({ at: Math.min(...inBlock), count: inBlock.size });
     }
     if (markedIdx.size === 0) return 0;
     for (const idx of markedIdx) lines[idx] = tombstoneLine(lines[idx]);
-    lines.splice(Math.min(...markedIdx), 0, `<!-- task-consolidator:moved ${markedIdx.size} ${spec.comment} to ${destinationDate} -->`);
+    // From the bottom up, so an insertion never shifts a comment still to come.
+    for (const { at, count } of comments.sort((a, b) => b.at - a.at))
+      lines.splice(at, 0, `<!-- task-consolidator:moved ${count} ${spec.comment} to ${destinationDate} -->`);
     await this.app.vault.modify(note.file, lines.join("\n"));
     return markedIdx.size;
   }
