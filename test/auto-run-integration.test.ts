@@ -62,7 +62,7 @@ const PARENT_WITH_SUBTASK = '- [ ] Preparar exámenes #task ⏳ 2026-09-17';
 const SUBTASK_PLANNED = '  - [ ] 18:00 - 18:30 Repasar el tema 3 #task';
 
 /** A daily note with every managed block the plugin expects. */
-function dailyNote(options: { tasks?: string[]; reminders?: string[]; weeklyHeading?: boolean } = {}): string {
+function dailyNote(options: { plan?: string[]; tasks?: string[]; reminders?: string[]; weeklyHeading?: boolean } = {}): string {
   return [
     '---',
     'title: Daily Note',
@@ -73,8 +73,11 @@ function dailyNote(options: { tasks?: string[]; reminders?: string[]; weeklyHead
     ...(options.weeklyHeading === true ? [WEEKLY_HEADING] : []),
     '<!-- task-consolidator:weekly:end -->',
     '## Plan del día',
-    '<!-- task-consolidator:tasks:start -->',
+    '<!-- task-consolidator:plan:start -->',
+    ...(options.plan ?? []),
+    '<!-- task-consolidator:plan:end -->',
     '## Tareas pendientes',
+    '<!-- task-consolidator:tasks:start -->',
     ...(options.tasks ?? []),
     '<!-- task-consolidator:tasks:end -->',
     '## Tareas canceladas',
@@ -117,7 +120,8 @@ function seedVault(): MockVault {
   return vault;
 }
 
-async function startRun(vault: MockVault, settings: Record<string, unknown> = {}): Promise<void> {
+/** The plugin, loaded against the in-memory vault, without running anything. */
+async function loadPlugin(vault: MockVault, settings: Record<string, unknown> = {}): Promise<any> {
   const plugin = new (TaskConsolidatorPlugin as unknown as new (app: unknown, manifest: unknown) => any)(
     createApp(vault),
     {},
@@ -126,8 +130,23 @@ async function startRun(vault: MockVault, settings: Record<string, unknown> = {}
   Object.assign(plugin.settings, settings);
   // Shorten the grace period the test would otherwise spend waiting in real time.
   plugin.verifyGraceMs = 150;
+  return plugin;
+}
+
+async function startRun(vault: MockVault, settings: Record<string, unknown> = {}): Promise<void> {
+  const plugin = await loadPlugin(vault, settings);
   await plugin.runAutomaticConsolidation();
 }
+
+/** The lines between a marker pair of the note, for readable assertions. */
+function section(content: string, pair: { start: string; end: string }): string[] {
+  const lines = content.split('\n');
+  const start = lines.indexOf(pair.start), end = lines.indexOf(pair.end);
+  return start < 0 || end < 0 ? ['<missing>'] : lines.slice(start + 1, end);
+}
+
+const PLAN = { start: '<!-- task-consolidator:plan:start -->', end: '<!-- task-consolidator:plan:end -->' };
+const BACKLOG = { start: '<!-- task-consolidator:tasks:start -->', end: '<!-- task-consolidator:tasks:end -->' };
 
 async function main(): Promise<void> {
   console.log('\nThe ordinary run: everything is migrated, and then marked');
@@ -299,6 +318,226 @@ async function main(): Promise<void> {
     const today = vault.content(TODAY_PATH);
     checkTrue('the line arrives with its scheduling intact', today.includes(`- [ ] ${PLANNED_WITH_TIME.slice(6)}`));
     checkTrue('and the tombstone keeps it as well', vault.content(YESTERDAY_PATH).includes('- [>] 11:20 - 12:00'));
+  }
+
+  console.log("\nA task planned for today arrives under 'Plan del día'");
+
+  {
+    resetNotices();
+    const vault = new MockVault();
+    const plannedForToday = '- [ ] Revisar el tema 3 #task [scheduled:: 2026-09-18T09:00] [duration:: 30m]';
+    vault.seed(YESTERDAY_PATH, dailyNote({ tasks: [PLAIN_TASK, plannedForToday] }));
+    vault.seed(TODAY_PATH, TEMPLATE_TODAY);
+    vault.seed(REMINDERS_FILE, '# Recordatorios\n');
+    vault.seed(NOTES_FILE, '# Apuntes\n');
+    await startRun(vault);
+
+    const today = vault.content(TODAY_PATH);
+    const plan = section(today, PLAN).join('\n');
+    const backlog = section(today, BACKLOG).join('\n');
+    checkTrue('the task planned for today is the day\'s plan, not the backlog', plan.includes('Revisar el tema 3'));
+    checkTrue('it keeps its scheduling, since today is the day it meant', plan.includes('[scheduled:: 2026-09-18T09:00]'));
+    checkTrue('the unplanned task waits in the backlog', backlog.includes('Pasar palabras al #amawal'));
+    checkTrue('and the plan is not duplicated into the backlog', !backlog.includes('Revisar el tema 3'));
+  }
+
+  console.log('\nWith a note that has no plan block: everything goes to the backlog, as before');
+
+  {
+    resetNotices();
+    const vault = new MockVault();
+    const plannedForToday = '- [ ] Revisar el tema 3 #task [scheduled:: 2026-09-18T09:00] [duration:: 30m]';
+    vault.seed(YESTERDAY_PATH, dailyNote({ tasks: [plannedForToday] }));
+    vault.seed(
+      TODAY_PATH,
+      dailyNote({ weeklyHeading: true }).replace('<!-- task-consolidator:plan:start -->\n<!-- task-consolidator:plan:end -->\n', ''),
+    );
+    vault.seed(REMINDERS_FILE, '# Recordatorios\n');
+    vault.seed(NOTES_FILE, '# Apuntes\n');
+    await startRun(vault);
+
+    checkTrue(
+      'an older note is left with its single section',
+      section(vault.content(TODAY_PATH), BACKLOG).join('\n').includes('Revisar el tema 3'),
+    );
+  }
+
+  console.log('\nThe reconcile command: both directions and clock order');
+
+  {
+    resetNotices();
+    const early = '- [ ] Revisar materia #task [scheduled:: 2026-09-18T08:00] [duration:: 30m]';
+    const late = '- [ ] Preparar examen #task [scheduled:: 2026-09-18T09:00] [duration:: 1h]';
+    const tomorrow = '- [ ] Preparar materia #task [scheduled:: 2026-09-19T08:00]';
+    const vault = new MockVault();
+    vault.seed(TODAY_PATH, dailyNote({ plan: [late], tasks: [early, tomorrow, PLAIN_TASK] }));
+    const plugin = await loadPlugin(vault);
+    await plugin.reconcilePlanSections();
+
+    const afterMove = vault.content(TODAY_PATH);
+    const plan = section(afterMove, PLAN).join('\n');
+    const backlog = section(afterMove, BACKLOG).join('\n');
+    checkTrue('the 8:00 task is carried into the plan', plan.includes(early));
+    checkTrue('and it sits above the 9:00 one', plan.indexOf(early) < plan.indexOf(late));
+    checkTrue('a task planned for tomorrow stays in the backlog', backlog.includes(tomorrow));
+    checkTrue('and so does one that is not planned at all', backlog.includes(PLAIN_TASK));
+    checkTrue('the command reports the move', notices.some((message) => message.includes("1 to 'Plan del día'")));
+
+    // The same rule, backwards: the day the plan line is planned for is no
+    // longer this one, so the task belongs to the backlog again.
+    vault.seed(TODAY_PATH, afterMove.replace('[scheduled:: 2026-09-18T08:00]', '[scheduled:: 2026-09-17T08:00]'));
+    await plugin.reconcilePlanSections();
+    const afterReturn = vault.content(TODAY_PATH);
+    checkTrue('a plan line whose day is not today goes back', section(afterReturn, BACKLOG).join('\n').includes('Revisar materia'));
+    checkTrue('and leaves the plan', !section(afterReturn, PLAN).join('\n').includes('Revisar materia'));
+    checkTrue('while the task that is today\'s plan stays', section(afterReturn, PLAN).join('\n').includes('Preparar examen'));
+
+    await plugin.reconcilePlanSections();
+    checkTrue('a pass with nothing to change writes nothing', vault.content(TODAY_PATH) === afterReturn);
+    checkTrue('and tells you so', notices.some((message) => message.includes('already where it belongs')));
+  }
+
+  console.log('\nThe watcher: a drag in the ruler is enough');
+
+  {
+    resetNotices();
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const late = '- [ ] Preparar examen #task [scheduled:: 2026-09-18T09:00] [duration:: 1h]';
+    const vault = new MockVault();
+    vault.seed(TODAY_PATH, dailyNote({ plan: [late], tasks: [PLAIN_TASK] }));
+    vault.emitEvents = true;
+    let writes = 0;
+    vault.onWrite = (path) => { if (path === TODAY_PATH) writes += 1; };
+    const plugin = await loadPlugin(vault, { autoConsolidate: false });
+    plugin.reconcileDelayMs = 30;
+
+    // The ruler's write: the line keeps its place, only its scheduling changes.
+    const today = vault.getAbstractFileByPath(TODAY_PATH)!;
+    const dragged = vault.content(TODAY_PATH).replace(PLAIN_TASK, `${PLAIN_TASK} [scheduled:: 2026-09-18T08:00] [duration:: 30m]`);
+    await vault.modify(today, dragged);
+    await sleep(200);
+
+    const moved = vault.content(TODAY_PATH);
+    checkTrue('the task is carried into the plan with no command at all', section(moved, PLAN).join('\n').includes('Pasar palabras al #amawal'));
+    checkTrue('and leaves the backlog', !section(moved, BACKLOG).join('\n').includes('Pasar palabras al #amawal'));
+    checkTrue('it lands in clock order, below the 9:00 task', section(moved, PLAN).join('\n').indexOf('Pasar palabras') < section(moved, PLAN).join('\n').indexOf('Preparar examen'));
+    checkTrue('the drag and one move: exactly two writes', writes === 2);
+
+    // A write that changes nothing must stay a write that changes nothing: the
+    // plugin's own move re-arms nothing, and a no-op save is not rearranged.
+    const writesAfterMove = writes;
+    await vault.modify(today, vault.content(TODAY_PATH));
+    await sleep(200);
+    checkTrue('a save that changes nothing is not written over', writes === writesAfterMove + 1);
+
+    // Un-planning, the way the ruler does it: the marks go, the line stays.
+    await vault.modify(today, vault.content(TODAY_PATH).replace(' [scheduled:: 2026-09-18T08:00] [duration:: 30m]', ''));
+    await sleep(200);
+    const returned = vault.content(TODAY_PATH);
+    checkTrue('dragging it back to Unscheduled returns it to the backlog', section(returned, BACKLOG).join('\n').includes('Pasar palabras al #amawal'));
+    checkTrue('and the plan keeps only what is planned', !section(returned, PLAN).join('\n').includes('Pasar palabras al #amawal'));
+  }
+
+  console.log('\nThe watcher never acts on your typing');
+
+  {
+    resetNotices();
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const vault = new MockVault();
+    vault.seed(TODAY_PATH, dailyNote({ tasks: [PLAIN_TASK] }));
+    vault.emitEvents = true;
+    let writes = 0;
+    vault.onWrite = (path) => { if (path === TODAY_PATH) writes += 1; };
+    const plugin = await loadPlugin(vault, { autoConsolidate: false });
+    plugin.reconcileDelayMs = 30;
+
+    // What a person does: a new task typed where they want it, unscheduled.
+    const typed = '- [ ] Tarea de prueba';
+    const today = vault.getAbstractFileByPath(TODAY_PATH)!;
+    await vault.modify(
+      today,
+      vault.content(TODAY_PATH).replace('<!-- task-consolidator:plan:start -->', `<!-- task-consolidator:plan:start -->\n${typed}`),
+    );
+    await sleep(200);
+
+    const afterTyping = vault.content(TODAY_PATH);
+    checkTrue('a line typed into the plan stays exactly where you typed it', afterTyping.includes(`<!-- task-consolidator:plan:start -->\n${typed}`));
+    checkTrue('it was not carried to the backlog', !afterTyping.split('<!-- task-consolidator:tasks:start -->')[1].includes('Tarea de prueba'));
+    checkTrue('and the typing was the only write', writes === 1);
+
+    // Renaming a task is the same story: yours, and never rearranged.
+    await vault.modify(today, afterTyping.replace(typed, '- [ ] Tarea de prueba renombrada'));
+    await sleep(200);
+    checkTrue('renaming it does not move it either', vault.content(TODAY_PATH).includes('- [ ] Tarea de prueba renombrada'));
+    checkTrue('and again only the two writes of yours happened', writes === 2);
+  }
+
+  console.log("\nThe watcher still recognises the ruler's own rewrite, tag and all");
+
+  {
+    resetNotices();
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const vault = new MockVault();
+    // The same task, before and after the ruler rebuilds its line: the tag and
+    // the `➕` stamp are gone, and only the scheduling was added.
+    const beforeRebuild = '- [ ] Preparar materia #materia/sistemas-instrumentacion #task ➕ 2026-09-16';
+    const rebuilt = '- [ ] Preparar materia #materia/sistemas-instrumentacion   [scheduled:: 2026-09-18T11:00]  [duration:: 2h]';
+    vault.seed(TODAY_PATH, dailyNote({ tasks: [PLAIN_TASK, beforeRebuild] }));
+    vault.emitEvents = true;
+    const plugin = await loadPlugin(vault, { autoConsolidate: false });
+    plugin.reconcileDelayMs = 30;
+
+    const today = vault.getAbstractFileByPath(TODAY_PATH)!;
+    await vault.modify(today, vault.content(TODAY_PATH).replace(beforeRebuild, rebuilt));
+    await sleep(200);
+
+    checkTrue("the ruler's lossy rebuild still reads as the same task", section(vault.content(TODAY_PATH), PLAN).join('\n').includes(rebuilt));
+  }
+
+  console.log('\nThe watcher, with the setting off: the note is only changed by hand');
+
+  {
+    resetNotices();
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const vault = new MockVault();
+    vault.seed(TODAY_PATH, dailyNote({ tasks: [PLAIN_TASK] }));
+    vault.emitEvents = true;
+    let writes = 0;
+    vault.onWrite = (path) => { if (path === TODAY_PATH) writes += 1; };
+    const plugin = await loadPlugin(vault, { autoConsolidate: false, autoReconcile: false });
+    plugin.reconcileDelayMs = 30;
+
+    const today = vault.getAbstractFileByPath(TODAY_PATH)!;
+    await vault.modify(today, vault.content(TODAY_PATH).replace(PLAIN_TASK, `${PLAIN_TASK} [scheduled:: 2026-09-18T08:00]`));
+    await sleep(200);
+
+    checkTrue('nothing is moved', section(vault.content(TODAY_PATH), PLAN).length === 0);
+    checkTrue('and only the drag wrote', writes === 1);
+  }
+
+  console.log('\nThe watcher, on a note without a plan block');
+
+  {
+    resetNotices();
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const vault = new MockVault();
+    vault.seed(
+      TODAY_PATH,
+      dailyNote({ tasks: [PLAIN_TASK] }).replace('<!-- task-consolidator:plan:start -->\n<!-- task-consolidator:plan:end -->\n', ''),
+    );
+    vault.emitEvents = true;
+    let writes = 0;
+    vault.onWrite = (path) => { if (path === TODAY_PATH) writes += 1; };
+    const plugin = await loadPlugin(vault, { autoConsolidate: false });
+    plugin.reconcileDelayMs = 30;
+
+    const today = vault.getAbstractFileByPath(TODAY_PATH)!;
+    const before = vault.content(TODAY_PATH);
+    await vault.modify(today, before.replace(PLAIN_TASK, `${PLAIN_TASK} [scheduled:: 2026-09-18T08:00]`));
+    await sleep(200);
+
+    checkTrue('an older note is never rearranged', vault.content(TODAY_PATH).includes(`${PLAIN_TASK} [scheduled:: 2026-09-18T08:00]`));
+    checkTrue('and nothing beyond the drag was written', writes === 1);
   }
 
   console.log(`\n${checks} checks passed\n`);

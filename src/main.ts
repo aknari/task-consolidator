@@ -4,6 +4,7 @@ import {
   isOperonLine,
   normalizeTaskLine,
   prepareMigratedLine,
+  scheduledDate,
   stampOperonStart,
   stripPastSchedule,
   taskKey,
@@ -11,6 +12,7 @@ import {
   tombstoneOperonLines,
   type LineOptions,
 } from "./lines";
+import { findMarkerBlock, isSchedulingOnlyChange, reconcileSections, type MarkerBlock, type ReconcileOptions } from "./sections";
 import { AUTO_VERIFY_MS, autoRunDelay, survivors } from "./auto-run";
 import {
   buildWeeklySummary,
@@ -37,12 +39,15 @@ interface TaskConsolidatorSettings {
   taskTag: string;
   stampCreatedDate: boolean;
   clearPastSchedule: boolean;
+  autoReconcile: boolean;
   migrateNotes: boolean;
   migrateReminders: boolean;
   recentReminders: number;
   refreshOperonIndex: boolean;
   tasksMarkerStart: string;
   tasksMarkerEnd: string;
+  planMarkerStart: string;
+  planMarkerEnd: string;
   cancelledMarkerStart: string;
   cancelledMarkerEnd: string;
   remindersMarkerStart: string;
@@ -58,6 +63,8 @@ interface TaskConsolidatorSettings {
 const MARKERS = {
   tasksStart: "<!-- task-consolidator:tasks:start -->",
   tasksEnd: "<!-- task-consolidator:tasks:end -->",
+  planStart: "<!-- task-consolidator:plan:start -->",
+  planEnd: "<!-- task-consolidator:plan:end -->",
   cancelledStart: "<!-- task-consolidator:cancelled:start -->",
   cancelledEnd: "<!-- task-consolidator:cancelled:end -->",
   remindersStart: "<!-- task-consolidator:reminders:start -->",
@@ -81,12 +88,15 @@ const DEFAULT_SETTINGS: TaskConsolidatorSettings = {
   taskTag: "#task",
   stampCreatedDate: true,
   clearPastSchedule: true,
+  autoReconcile: true,
   migrateNotes: true,
   migrateReminders: true,
   recentReminders: 9,
   refreshOperonIndex: false,
   tasksMarkerStart: MARKERS.tasksStart,
   tasksMarkerEnd: MARKERS.tasksEnd,
+  planMarkerStart: MARKERS.planStart,
+  planMarkerEnd: MARKERS.planEnd,
   cancelledMarkerStart: MARKERS.cancelledStart,
   cancelledMarkerEnd: MARKERS.cancelledEnd,
   remindersMarkerStart: MARKERS.remindersStart,
@@ -109,7 +119,6 @@ type WeeklyAction =
   | { kind: "write"; body: string[]; headline: string }
   | { kind: "tidy" }
   | { kind: "none" };
-interface MarkerBlock { start: number; end: number; content: string; }
 
 /** Writes the automatic run defers until today's note has been verified. */
 interface DeferredRun {
@@ -158,6 +167,18 @@ export default class TaskConsolidatorPlugin extends Plugin {
   /** Grace period before the sources are marked; a test hook shortens it. */
   private verifyGraceMs = AUTO_VERIFY_MS;
   private autoRanToday: string | null = null;
+  /** Timer of the automatic section reconcile; every write to the note re-arms it. */
+  private reconcileTimer: number | null = null;
+  /** True while the automatic reconcile is writing, so its own write is ignored. */
+  private reconciling = false;
+  /** Quiet period the note must have had before the automatic reconcile acts. */
+  private reconcileDelayMs = 2000;
+  /**
+   * Last version seen of today's note. It is what tells the ruler's write from
+   * yours: only a change that leaves every line's identity alone is acted on by
+   * itself (see `maybeAutoReconcile`).
+   */
+  private lastContent = new Map<string, string>();
 
   async onload(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -167,12 +188,41 @@ export default class TaskConsolidatorPlugin extends Plugin {
     if (this.settings.weeklyLanguage !== "en") this.settings.weeklyLanguage = "es";
     this.addCommand({ id: "preview-consolidation", name: "Preview daily consolidation", callback: () => this.previewConsolidation() });
     this.addCommand({ id: "consolidate-daily-note", name: "Consolidate current daily note", callback: () => this.consolidateCurrentDailyNote() });
+    this.addCommand({ id: "reconcile-plan-sections", name: "Reconcile the plan and pending sections", callback: () => this.reconcilePlanSections() });
     this.addCommand({ id: "migrate-daily-material", name: "Migrate previous daily notes material", callback: () => this.migratePreviousMaterial() });
     this.addCommand({ id: "archive-old-daily-notes", name: "Archive old daily notes", callback: () => this.archiveOldDailyNotes() });
     this.addSettingTab(new TaskConsolidatorSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => { void this.maybeAutoConsolidate(file); }));
-    this.registerEvent(this.app.vault.on("modify", (file) => { void this.maybeAutoConsolidate(file); }));
+    this.registerEvent(this.app.vault.on("create", (file) => { void this.maybeAutoConsolidate(file); void this.maybeAutoReconcile(file); }));
+    this.registerEvent(this.app.vault.on("modify", (file) => { void this.maybeAutoConsolidate(file); void this.maybeAutoReconcile(file); }));
     this.registerEvent(this.app.vault.on("rename", (file) => { if (file instanceof TFile) void this.maybeAutoConsolidate(file); }));
+    await this.captureTodayNote();
+  }
+
+  /**
+   * Remembers today's note as it stands, so the first write of the session can
+   * already be told apart from your typing. Without it the first change would
+   * have nothing to compare against and would be ignored — which reads as the
+   * automatic reconcile being broken.
+   */
+  private async captureTodayNote(): Promise<void> {
+    try {
+      const current = await this.currentDailyNote();
+      if (current === null) return;
+      this.lastContent.set(current.file.path, await this.app.vault.read(current.file));
+    } catch (error) {
+      console.error("Task Consolidator: today's note could not be read", error);
+    }
+  }
+
+  /**
+   * Timers are cleared on the way out: a reconcile armed a second before you
+   * disable the plugin must not write to the note after it is gone.
+   */
+  onunload(): void {
+    if (this.reconcileTimer !== null) window.clearTimeout(this.reconcileTimer);
+    if (this.autoTimer !== null) window.clearTimeout(this.autoTimer);
+    this.reconcileTimer = null;
+    this.autoTimer = null;
   }
 
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
@@ -186,17 +236,14 @@ export default class TaskConsolidatorPlugin extends Plugin {
   }
 
   private findBlock(content: string, startMarker: string, endMarker: string): MarkerBlock | null {
-    const lines = content.split("\n");
-    const starts = lines.reduce<number[]>((found, line, index) => { if (line.trim() === startMarker) found.push(index); return found; }, []);
-    const ends = lines.reduce<number[]>((found, line, index) => { if (line.trim() === endMarker) found.push(index); return found; }, []);
-    if (starts.length !== 1 || ends.length !== 1 || ends[0] <= starts[0]) return null;
-    return { start: starts[0], end: ends[0], content: lines.slice(starts[0] + 1, ends[0]).join("\n") };
+    return findMarkerBlock(content, startMarker, endMarker);
   }
 
   private validateManagedBlocks(content: string): string[] {
     const errors: string[] = [];
     for (const [name, start, end] of [
       ["tasks", this.settings.tasksMarkerStart, this.settings.tasksMarkerEnd],
+      ["plan", this.settings.planMarkerStart, this.settings.planMarkerEnd],
       ["cancelled", this.settings.cancelledMarkerStart, this.settings.cancelledMarkerEnd],
       ["reminders", this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd],
       ["notes", this.settings.notesMarkerStart, this.settings.notesMarkerEnd],
@@ -225,6 +272,25 @@ export default class TaskConsolidatorPlugin extends Plugin {
       stampCreatedDate: this.settings.stampCreatedDate,
       clearPastSchedule: this.settings.clearPastSchedule,
     };
+  }
+
+  /** The plan block and the backlog block, as the section reconciler sees them. */
+  private reconcileOptions(noteDate: string): ReconcileOptions {
+    return {
+      plan: { start: this.settings.planMarkerStart, end: this.settings.planMarkerEnd },
+      tasks: { start: this.settings.tasksMarkerStart, end: this.settings.tasksMarkerEnd },
+      noteDate,
+    };
+  }
+
+  /**
+   * Whether the note can keep its sections apart at all. A note without the
+   * plan marker pair is an older note (or a template that has not been updated
+   * yet): every task goes to the backlog, exactly as before, and nothing is
+   * moved between sections.
+   */
+  private hasPlanBlock(content: string): boolean {
+    return this.findBlock(content, this.settings.planMarkerStart, this.settings.planMarkerEnd) !== null;
   }
 
   /**
@@ -471,9 +537,11 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const block = this.findBlock(content, startMarker, endMarker);
     if (block === null) return { inserted: 0, blockFound: false, keys: [] };
     const lines = content.split("\n");
-    const existingKeys = this.existingTaskKeys(lines, block, current.date);
+    const plan = this.findBlock(content, this.settings.planMarkerStart, this.settings.planMarkerEnd);
+    const existingKeys = this.existingTaskKeys(lines, block, current.date, plan);
     const options = this.lineOptions();
-    const toInsert: string[] = [];
+    const toBacklog: string[] = [];
+    const toPlan: string[] = [];
     const insertedKeys: string[] = [];
     for (const move of moves) {
       // The parent is prepared (state, tag, source-date stamp); an indented
@@ -495,12 +563,30 @@ export default class TaskConsolidatorPlugin extends Plugin {
       if (kind === "pending" && existingKeys.has(key)) continue;
       existingKeys.add(move.key);
       insertedKeys.push(key);
-      toInsert.push(...insertLines);
+      // A task already planned for this very day *is* the day's plan, so it
+      // arrives under '## Plan del día' rather than in the backlog. The plan
+      // block's presence is the whole switch: a note without it (an older note,
+      // or a template not updated yet) receives everything in the backlog, as
+      // it always did. This is the same rule a manual pass applies to the note,
+      // which is what makes the two agree.
+      const planned = kind === "pending" && plan !== null && scheduledDate(insertLines[0], current.date) === current.date;
+      (planned ? toPlan : toBacklog).push(...insertLines);
     }
-    if (toInsert.length === 0) return { inserted: 0, blockFound: true, keys: [] };
-    lines.splice(block.end, 0, ...toInsert);
-    await this.app.vault.modify(current.file, lines.join("\n"));
-    return { inserted: toInsert.length, blockFound: true, keys: insertedKeys };
+    if (toBacklog.length === 0 && toPlan.length === 0) return { inserted: 0, blockFound: true, keys: [] };
+    const out = content.split("\n");
+    // Higher line indexes first, so a splice never moves the range of the other
+    // block. Usually the plan sits above the backlog, but nothing promises it.
+    const insertions = [
+      { at: block.end, lines: toBacklog },
+      ...(plan === null ? [] : [{ at: plan.end, lines: toPlan }]),
+    ].filter((insertion) => insertion.lines.length > 0).sort((a, b) => b.at - a.at);
+    for (const insertion of insertions) out.splice(insertion.at, 0, ...insertion.lines);
+    // Then the same rule over the whole note: clock order inside the plan, and
+    // back to the backlog anything whose scheduling no longer means today (a
+    // line that changed hands while the note was open, say).
+    const reconciled = reconcileSections(out.join("\n"), this.reconcileOptions(current.date));
+    await this.app.vault.modify(current.file, reconciled?.content ?? out.join("\n"));
+    return { inserted: toBacklog.length + toPlan.length, blockFound: true, keys: insertedKeys };
   }
 
   /**
@@ -518,7 +604,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * source note holds while inserting, so two source lines that differ in
    * nothing but their scheduling are both carried in.
    */
-  private existingTaskKeys(lines: string[], block: MarkerBlock, targetDate: string): Set<string> {
+  private existingTaskKeys(lines: string[], block: MarkerBlock, targetDate: string, plan: MarkerBlock | null = null): Set<string> {
     const tag = this.taskTag();
     const keys = new Set<string>();
     // Both forms of a line count as present: as it stands, and as this run would
@@ -529,12 +615,17 @@ export default class TaskConsolidatorPlugin extends Plugin {
       keys.add(taskKey(line, tag));
       if (this.settings.clearPastSchedule) keys.add(this.destinationKey(line, targetDate));
     };
-    // `[^]]` is not "anything but a bracket" in JavaScript: it is the any-char
-    // class followed by a literal `]`, so it matched no task line at all and
-    // this set stayed empty for every plain task. `[^\]\n]` is what was meant:
-    // one status character between the brackets.
-    for (const line of lines.slice(block.start + 1, block.end)) {
-      if (/^\s*- \[[^\]\n]\](\s|$)/.test(line)) add(line);
+    // Both sections count: a task that already sits under '## Plan del día' is
+    // in this note just as much as one in the backlog, and inserting it again
+    // would duplicate it.
+    for (const range of plan === null ? [block] : [block, plan]) {
+      // `[^]]` is not "anything but a bracket" in JavaScript: it is the any-char
+      // class followed by a literal `]`, so it matched no task line at all and
+      // this set stayed empty for every plain task. `[^\]\n]` is what was meant:
+      // one status character between the brackets.
+      for (const line of lines.slice(range.start + 1, range.end)) {
+        if (/^\s*- \[[^\]\n]\](\s|$)/.test(line)) add(line);
+      }
     }
     for (const line of lines) if (isOperonLine(line)) add(line);
     return keys;
@@ -775,6 +866,117 @@ export default class TaskConsolidatorPlugin extends Plugin {
     return false;
   }
 
+  /**
+   * Puts every task of today's note in the section it belongs to: the ones
+   * planned for today under '## Plan del día', in clock order, and the rest in
+   * the backlog.
+   *
+   * It exists for the case consolidation never sees: a task planned, re-planned
+   * or unplanned *inside* today's note, which is exactly what the ruler writes
+   * when you drag a task — it rewrites the line where it stands, so the text of
+   * the note and the plan it describes drift apart. The rule is the same one
+   * consolidation applies to the lines it carries in, and it is reversible by
+   * construction: a task is in the plan while it is scheduled for today, and
+   * back in the backlog the moment it is not.
+   *
+   * It writes at most once, and only if something changes; the note is re-read
+   * just before writing and planned again if it changed underneath, so a note
+   * open in an editor is never rearranged from a stale copy.
+   *
+   * `notify` is off on the automatic path: a move that follows your own drag
+   * needs no announcement, and one notice per drag would turn the feature into
+   * an alarm. The command passes `true`, and there every outcome is said out
+   * loud, including the one that changes nothing.
+   */
+  private async reconcilePlanSections(): Promise<void> {
+    await this.reconcileToday(true);
+  }
+
+  private async reconcileToday(notify: boolean): Promise<void> {
+    const current = await this.currentDailyNote();
+    if (current === null) {
+      if (notify) new Notice("Task Consolidator: today's daily note was not found.");
+      return;
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const content = await this.app.vault.read(current.file);
+      const errors = this.validateManagedBlocks(content);
+      if (errors.length > 0) {
+        if (notify) new Notice(`Task Consolidator: stopped safely; ${errors.join("; ")}`);
+        return;
+      }
+      if (!this.hasPlanBlock(content)) {
+        if (notify) new Notice("Task Consolidator: today's note has no plan block, so there is nowhere to move a planned task. Add the plan marker pair to the daily-note template.");
+        return;
+      }
+      const result = reconcileSections(content, this.reconcileOptions(current.date));
+      if (result === null) {
+        if (notify) new Notice("Task Consolidator: every task is already where it belongs.");
+        return;
+      }
+      if ((await this.app.vault.read(current.file)) !== content) {
+        // The note changed while this pass was planned. The command may plan
+        // again from what it finds; the automatic path must not, because the
+        // change it would be rearranging is the one it never saw.
+        if (notify) continue;
+        return;
+      }
+      await this.app.vault.modify(current.file, result.content);
+      this.lastContent.set(current.file.path, result.content);
+      console.info("Task Consolidator: sections reconciled", { toPlan: result.toPlan, toPending: result.toPending });
+      if (!notify) return;
+      const parts: string[] = [];
+      if (result.toPlan.length > 0) parts.push(`${result.toPlan.length} to 'Plan del día'`);
+      if (result.toPending.length > 0) parts.push(`${result.toPending.length} back to 'Tareas pendientes'`);
+      new Notice(`Task Consolidator: ${parts.length > 0 ? parts.join(", ") : "the plan is now in clock order"}.`);
+      return;
+    }
+    if (notify) new Notice("Task Consolidator: today's note kept changing; nothing was rewritten. Try again once it has settled.");
+  }
+
+  /**
+   * Vault-event guard for the automatic reconcile: only today's note, only when
+   * the note is one this plugin may arrange, and only once it has been quiet.
+   *
+   * The wait is the whole safety story. Planning happens in the ruler, which
+   * writes the note once when you drop the task; moving the line a second write
+   * later, while you are still looking at it, is what changes the ground under
+   * your hands. Waiting for the note to stop changing puts the move after them,
+   * and re-arming on every write is also what keeps it out of the way while you
+   * type: the reconcile it never lands in the middle of a sentence.
+   */
+  private async maybeAutoReconcile(file: TFile): Promise<void> {
+    if (!this.settings.autoReconcile || this.reconciling || this.autoRunning || file.extension !== "md") return;
+    // This runs on every write to any note in the vault, so today's note is
+    // recognised from its path: a vault listing per keystroke is not worth it.
+    const folder = this.settings.dailyNotesFolder.replace(/\/+$/, "");
+    if (file.path !== `${folder}/${window.moment().format("YYYY-MM-DD")}.md`) return;
+    const content = await this.app.vault.read(file);
+    if (this.validateManagedBlocks(content).length > 0) return;
+    if (!this.hasPlanBlock(content)) return;
+    const before = this.lastContent.get(file.path);
+    this.lastContent.set(file.path, content);
+    if (before === undefined || before === content) return;
+    // Only the ruler's change is acted on by itself: it rewrites a line in
+    // place, so every line keeps its identity. A line you typed, deleted or
+    // renamed is yours — the move waits for the command, because rewriting the
+    // note under someone who is writing in it is exactly what must not happen.
+    if (!isSchedulingOnlyChange(before, content, this.taskTag())) return;
+    this.armReconcile();
+  }
+
+  /** Arms the automatic reconcile for when today's note has been quiet long enough. */
+  private armReconcile(): void {
+    if (this.reconcileTimer !== null) window.clearTimeout(this.reconcileTimer);
+    this.reconcileTimer = window.setTimeout(() => {
+      this.reconcileTimer = null;
+      this.reconciling = true;
+      this.reconcileToday(false)
+        .catch((error) => console.error("Task Consolidator: automatic section reconcile failed", error))
+        .finally(() => { this.reconciling = false; });
+    }, this.reconcileDelayMs);
+  }
+
   private async migratePreviousMaterial(): Promise<void> {
     const current = await this.currentDailyNote();
     if (current === null) { new Notice("Task Consolidator: today's daily note was not found."); return; }
@@ -931,6 +1133,7 @@ class TaskConsolidatorSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Maximum daily notes").setDesc("How many daily notes to keep before the oldest are archived when archiving runs (3–30).").addText((text) => text.setValue(String(this.plugin.settings.maxDailyNotes)).onChange(async (value) => { const n = Math.floor(Number(value)); if (Number.isFinite(n)) { this.plugin.settings.maxDailyNotes = Math.min(30, Math.max(3, n)); await this.plugin.saveSettings(); } }));
     new Setting(containerEl).setName("Automatic archiving").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoArchive).onChange(async (value) => { this.plugin.settings.autoArchive = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Run automatically when today's note is created").setDesc("When today's daily note is created with the managed markers, automatically consolidate pending and cancelled tasks and migrate reminders and notes from the previous note. Runs at most once per day.").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoConsolidate).onChange(async (value) => { this.plugin.settings.autoConsolidate = value; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Reconcile the plan automatically after planning").setDesc("When a task of today's note is planned for today — or unplanned, or planned for another day — what the ruler writes when you drag a task, move it to '## Plan del día' (or back to the backlog) once the note has been quiet for a moment. Nothing happens without a plan block in the note, and the command 'Reconcile the plan and pending sections' does the same on demand.").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoReconcile).onChange(async (value) => { this.plugin.settings.autoReconcile = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Weekly summary of the previous week").setDesc("When the first daily note of a new week is created, write a report of the previous week's daily notes (pending, completed and cancelled tasks) inside the weekly marker block. The report is inert — no checkboxes, no task metadata, no task tag — so it is never consolidated. The template's heading is carried over, and whenever no report is due — the other days of the week, or this setting being off — the untouched section is emptied, so the template's heading never hangs empty in the note. An existing summary, or text of your own, is never overwritten.").addToggle((toggle) => toggle.setValue(this.plugin.settings.weeklySummary).onChange(async (value) => { this.plugin.settings.weeklySummary = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Weekly summary language").setDesc("Language of the weekly summary text. Task lines are copied verbatim in whatever language you wrote them.").addDropdown((dropdown) => dropdown.addOption("es", "Español").addOption("en", "English").setValue(this.plugin.settings.weeklyLanguage).onChange(async (value) => { this.plugin.settings.weeklyLanguage = value === "en" ? "en" : "es"; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Include cancelled tasks").setDesc("Move tasks marked cancelled (- [-]) from previous notes into today's '## Tareas canceladas' block. Completed tasks (- [x]) are never moved.").addToggle((toggle) => toggle.setValue(this.plugin.settings.includeCancelled).onChange(async (value) => { this.plugin.settings.includeCancelled = value; await this.plugin.saveSettings(); }));

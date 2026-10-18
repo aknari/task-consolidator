@@ -14,7 +14,7 @@ Works with or without [Operon](https://github.com/hasanyilmaz/operon): task meta
 
 - **Pending task consolidation (real move).** `- [ ]` and `- [!]` tasks from previous daily notes are moved — not copied — into today's tasks block. The full line is relocated verbatim: a plain task gets the managed tag when it carries none and, if it has no date of its own, a ` ➕ YYYY-MM-DD` stamp with the day it came from; an Operon task is never decorated — its `{{...}}` fields are what keeps it the same task — except for the `{{dateStarted:: YYYY-MM-DD}}` it lacks. The source keeps the line as `- [>]`, the convention the legacy notes already use, with a non-destructive comment saying where the work went and with the Operon metadata removed, so no second line ever claims that `operonId`.
 - **The scheduling of a past day is not carried forward.** A task planned for the day it is leaving keeps a mark that pins it to that day — in a time-ruler (or any Dataview) column it would show under the past day instead of today's timeline, and dragging it would be the only way out. A pending task whose own scheduling date is earlier than the day it moves to arrives **unscheduled**, so it shows up in the ruler's unscheduled list to be planned again. That includes a bare `h:mm` prefix: it carries no date because the ruler reads it against the note it lives in, which is exactly what would silently re-plan the task for today once the line moves. Scheduling for today or a later day is left alone, and so is everything else (`due`, `start`, tags, links, Operon `{{...}}`); the `- [>]` left in the source note keeps its scheduling, because that is the record of how the day was planned. Can be turned off. See [Settings](#settings).
-- **Cancelled task carry-forward.** Tasks marked `- [-]` are moved into today's `## Tareas canceladas` block, so discarded tasks keep following you in case you want to rescue them. Completed tasks (`- [x]`) are never moved.
+- **The day's plan is not the backlog.** A daily note has two sections — `## Plan del día`, the plan in clock order, and `## Tareas pendientes`, the backlog — but planning happens in the ruler, which only rewrites the line where it stands. A task dragged into today's timeline would therefore stay written under `## Tareas pendientes`, and the note would stop matching the plan it describes. With the plan block in the template, a task planned for the note's own day arrives under `## Plan del día` (in clock order, all-day lines last), and one that is not planned for it — unscheduled, or planned for another day — stays in the backlog. Consolidation applies the rule to the lines it carries in, and the note itself is put right a moment after you drag a task in the ruler (or on demand, with *Reconcile the plan and pending sections*). Nothing is stored: the rule is read from the scheduling marks themselves, which is what makes it reversible — un-plan the task, and the next pass carries it back. Where a task goes is not a setting: the plan block's presence is the switch, and a note without it (an older note, or a template not updated yet) behaves exactly as before. The only setting is *when* the rule runs, automatically after a drag or only when you ask.
 - **Weekly summary.** When the first daily note of a new week is created, a report of the previous week's daily notes — pending, completed and cancelled tasks — is written into the weekly block. It is deliberately inert (no checkboxes, no task metadata, no task tag), so it is never mistaken for work to consolidate. See [Weekly summary](#weekly-summary).
 - **Reminder and note migration.** The `## Para recordar` and `## Apuntes diversos` blocks of the previous note are appended to dated sections in configurable Markdown files, and the most recent reminders are re-injected into today's note. An Operon task among the reminders moves into today's note as the live line — identity and all, plus a `{{dateStarted::}}` when it has none — while the recorded copies (the dated file, and the previous note once the reminder has moved on) keep it as an inert `- [>]` tombstone.
 - **Archiving.** Old daily notes are moved to a configurable archive folder (with collision checks) once the daily-note count exceeds a limit.
@@ -53,6 +53,7 @@ Open the command palette (`Cmd/Ctrl+P`) and use one of:
 |---|---|
 | `Task Consolidator: Preview daily consolidation` | Read-only report of pending and cancelled tasks that would move (per source note) and of the weekly summary that would be written. |
 | `Task Consolidator: Consolidate current daily note` | Move pending and cancelled tasks from previous daily notes into today's note, and write the previous week's summary if the weekly block is empty (asks for confirmation). |
+| `Task Consolidator: Reconcile the plan and pending sections` | Put today's tasks in the section they belong to: the ones planned for today under `## Plan del día`, in clock order, and the rest in the backlog. Writes only if something changes, and moves nothing else. The same happens by itself after a drag unless the automatic setting is off. |
 | `Task Consolidator: Migrate previous daily notes material` | Migrate reminders and notes from the previous daily note into the dated misc files and re-inject recent reminders (asks for confirmation). |
 | `Task Consolidator: Archive old daily notes` | Move the oldest daily notes to the archive folder until the configured maximum is kept. |
 
@@ -62,12 +63,14 @@ The run waits for the note to **settle** rather than firing a fixed time after t
 
 ## Managed blocks
 
-Your daily-note template should include these marker pairs. The plugin only touches content inside them; a missing, duplicated or incomplete marker pair is a safety error (the plugin reports it and writes nothing):
+Your daily-note template should include these marker pairs. The plugin only touches content inside them; a duplicated or incomplete marker pair is a safety error (the plugin reports it and writes nothing), while a block you leave out is simply not used:
 
 ```markdown
-<!-- task-consolidator:tasks:start -->
 ## Plan del día
+<!-- task-consolidator:plan:start -->
+<!-- task-consolidator:plan:end -->
 ## Tareas pendientes
+<!-- task-consolidator:tasks:start -->
 <!-- task-consolidator:tasks:end -->
 
 <!-- task-consolidator:cancelled:start -->
@@ -87,11 +90,24 @@ Your daily-note template should include these marker pairs. The plugin only touc
 <!-- task-consolidator:weekly:end -->
 ```
 
-- **tasks**: pending tasks to consolidate (`- [ ]`, `- [!]`, plus indented subtask lines).
+- **plan**: the day's plan. A task line belongs here exactly when it is scheduled for this note's own day; the order inside is by clock, all-day lines last. Omitting this block is not an error: the note simply keeps a single section, exactly as it did before the block existed.
+- **tasks**: pending tasks to consolidate and the backlog (`- [ ]`, `- [!]`, plus indented subtask lines).
 - **cancelled**: destination for carried-forward cancelled tasks (`- [-]`).
 - **reminders**: content migrated to the reminders file; recent lines are re-injected into today's note.
 - **notes**: content migrated to the notes file.
 - **weekly**: destination for the generated weekly summary. The heading lives *inside* the markers and is the one the report carries over, so rename it there and the plugin will use it. Notes created before you added this block are simply skipped (a missing marker pair is never an error; only a half-present pair is).
+
+## Plan del día and the backlog
+
+The two sections are the same list at two moments: what you mean to do today, and what is waiting. The rule that keeps them apart is one line long — **a task belongs in the plan exactly when it is scheduled for this note's own day** — and it is read from the scheduling marks themselves (`[scheduled:: …]` with an hour, a `⏳` date, a leading `h:mm`, `[date::]`, `@{…}`): the notations the ruler writes, and the same ones the rest of this plugin already has to understand.
+
+- **Both directions.** Un-planning is as ordinary as planning: drag the task back to *Unscheduled*, or plan it for another day, and the next pass returns it to the backlog — at its end, the place you would have given it.
+- **Clock order, all-day last.** The plan is written in the order you read it; the backlog keeps the order it had.
+- **Your typing is never rearranged.** The automatic pass only recognises the ruler's own footprint — the same lines, with and without scheduling. A task you type by hand, wherever you type it, stays where you put it; it moves to the plan when you plan it in the ruler, not because a rule was applied to your draft.
+- **A task keeps what was written beside it.** Its indented subtasks travel with it, and so does a blank separator or a line you completed since: ticking a planned task does not make it drift to the bottom of the section.
+- **What is never moved.** Only `- [ ]` and `- [!]` lines take part. `- [x]` is the record of what was done, `- [-]` waits for rescue and `- [>]` is a tombstone saying the work left the note; moving any of them would rewrite history. Text outside the two blocks is never read as a task, and an ambiguous marker pair leaves the note alone.
+- **After a drag, once the note settles.** With *Reconcile the plan automatically after planning* on (the default) the rule also runs by itself: when today's note is written — the ruler's write when you drop a task — the plugin waits for the note to stop changing (about 2 s) and then moves the line. It only acts on **a change of scheduling**: the ruler rewrites a line in place, so every line keeps its identity, while a line you type, delete or rename is a change of the note's content — that one is yours, and the move waits for the command. A move that would change nothing is never written, so the plugin's own write cannot start a run of its own. Turn the setting off to keep the manual command only.
+- **No setting decides where a task goes.** The plan block's presence is the switch for the split — a note without one is never rearranged — and with it the rule above is the only criterion. The one setting there is (*Reconcile the plan automatically after planning*) decides only *when* it runs.
 
 ## Weekly summary
 
@@ -140,6 +156,7 @@ The manual commands have no week gate (you asked for it): they write the summary
 | Weekly summary of the previous week | on | Write the previous week's summary into the weekly block when the first daily note of a new week is created. Written only into an untouched block; when no report is due (including when this is off), an untouched block is emptied. |
 | Weekly summary language | `es` | Language of the summary text (`es` / `en`). Task lines are copied verbatim. |
 | Run automatically when today's note is created | on | Run migration + consolidation once per day when today's note is created with markers. |
+| Reconcile the plan automatically after planning | on | Move a task to `## Plan del día` (or back to the backlog) once today's note has been quiet for about 2 s after a write — which is what the ruler does when you drag a task. Off: only the command moves tasks. |
 | Include cancelled tasks | on | Carry `- [-]` tasks into today's cancelled block. Completed tasks are never moved. |
 | Task tag | `#task` | Tag appended to migrated *plain* task lines that do not carry it yet. Operon tasks are never tagged. Empty = add no tag. |
 | Carry the source date onto migrated tasks | on | Record the day a migrated task came from on the line carried into today's note: a plain task gets ` ➕ YYYY-MM-DD` (unless it already has a ` ➕` date) and an Operon task with no start date gets `{{dateStarted:: YYYY-MM-DD}}`. Tasks that already carry their own date are left untouched. |
@@ -158,6 +175,7 @@ The manual commands have no week gate (you asked for it): they write the summary
 - Operations are idempotent: running twice produces the same result (the second run finds nothing to do).
 - Automatic mode is limited to notes that carry the managed markers, runs at most once per day, and never removes a task from its source unless the insertion into today's note succeeded.
 - The automatic run waits for today's note to settle (4 s of quiet, and at most 40 s of waiting) before it starts, so it lands after the last writer. A short delay after the run checks once more that the note still holds what was written into it; if it does not, nothing is marked as moved, you are told, and the previous note keeps its tasks — an automatic run can therefore never be the reason a task exists nowhere.
+- The automatic reconcile acts only when the note's change is a change of scheduling (the ruler's signature), never on a line you typed, deleted or renamed; it then waits until today's note has been quiet for about 2 s, re-reads it, and writes only when the move would change something — so a drag is followed by exactly one write, never a run of them. If the note changes while it is deciding, the automatic path gives up instead of rearranging a version it never saw.
 - The weekly summary is written only into an untouched weekly block (its heading and blank lines, or nothing), so an existing summary is never overwritten.
 
 ## Operon integration
@@ -178,7 +196,7 @@ Operon is **optional** — the plugin is a Markdown processor and works with pla
 ```bash
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # the weekly-summary core (no Obsidian required)
+npm test            # the weekly summary, the line helpers and the section rule (no Obsidian required)
 npm run build       # bundles src/main.ts into dist/
 npm run deploy      # build, then copy dist/ into .obsidian/plugins/task-consolidator/
 ```

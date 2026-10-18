@@ -44,6 +44,17 @@ export class TFile extends TAbstractFile {
 export class MockVault {
   private contents = new Map<string, string>();
   private files = new Map<string, TFile>();
+  /** Handlers registered through `on`, by vault event. */
+  private handlers = new Map<string, Array<(file: TAbstractFile) => void>>();
+
+  /**
+   * Whether a write made through the vault API notifies the handlers.
+   *
+   * Off by default on purpose: most tests drive the plugin directly, and
+   * delivering events there would start runs they never asked for. The tests
+   * that *are* about the event path switch it on.
+   */
+  emitEvents = false;
 
   /**
    * Called after every write made *through the vault API*. Writes made with
@@ -98,15 +109,25 @@ export class MockVault {
     this.contents.set(newPath, content);
   }
 
-  on(): unknown {
-    // The integration test calls into the plugin directly, so no events are
-    // needed; registering must simply not throw.
+  on(event: string, callback: (file: TAbstractFile) => void): unknown {
+    const list = this.handlers.get(event) ?? [];
+    list.push(callback);
+    this.handlers.set(event, list);
     return null;
+  }
+
+  /** Delivers a vault event, when the test asked for them. */
+  private fire(event: string, path: string): void {
+    if (!this.emitEvents) return;
+    const file = this.files.get(path);
+    if (file === undefined) return;
+    for (const callback of this.handlers.get(event) ?? []) callback(file);
   }
 
   private write(path: string, content: string): void {
     this.contents.set(path, content);
     this.onWrite?.(path);
+    this.fire("modify", path);
   }
 }
 

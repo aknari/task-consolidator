@@ -236,6 +236,56 @@ export function scheduledDate(line: string, sourceDate = ""): string | null {
 }
 
 /**
+ * The hour a line is planned at, as minutes after midnight, or `null` when its
+ * scheduling carries no hour of its own (an all-day task, or no scheduling at
+ * all).
+ *
+ * It reads the same marks as `scheduledDate`, in the same order, so the two
+ * answers never disagree about which mark is the real one: the inline date
+ * field first (where the hour may ride along), then the Tasks emoji, the Kanban
+ * braces, and the `simple` prefix. `[allDay:: true]` wins over everything: it
+ * says the task occupies the day rather than an hour, so it sorts with the
+ * all-day lines even when a stray `[startTime::]` survives on the line.
+ *
+ * Only the hour matters, never the date: the caller has already decided the
+ * line belongs to a day (`scheduledDate`), and this is what orders the tasks
+ * inside it.
+ */
+export function scheduledStartMinutes(line: string): number | null {
+  if (/\[\s*allDay\s*::\s*true\s*\]/u.test(line)) return null;
+  for (const key of SCHEDULE_DATE_FIELDS) {
+    const value = inlineField(line, key);
+    if (value === null) continue;
+    const dated = /(\d{4}-\d{2}-\d{2})[T ](\d{1,2}):(\d{2})/u.exec(value);
+    if (dated !== null) return toMinutes(dated[2], dated[3]);
+    const bare = /(\d{1,2}):(\d{2})/u.exec(value);
+    if (bare !== null) return toMinutes(bare[1], bare[2]);
+  }
+  const startTime = inlineField(line, "startTime");
+  if (startTime !== null) {
+    const bare = /(\d{1,2}):(\d{2})/u.exec(startTime);
+    if (bare !== null) return toMinutes(bare[1], bare[2]);
+  }
+  const tasks = /⏳\s*\d{4}-\d{2}-\d{2}(?:[T ](\d{1,2}):(\d{2}))?/u.exec(line);
+  if (tasks !== null) return tasks[1] === undefined ? null : toMinutes(tasks[1], tasks[2]);
+  const kanban = /@\{\s*\d{4}-\d{2}-\d{2}(?:[T ](\d{1,2}):(\d{2}))?[^}]*\}/u.exec(line);
+  if (kanban !== null) {
+    if (kanban[1] !== undefined) return toMinutes(kanban[1], kanban[2]);
+    const kanbanTime = /@@\{\s*(\d{1,2}):(\d{2})\s*\}/u.exec(line);
+    return kanbanTime === null ? null : toMinutes(kanbanTime[1], kanbanTime[2]);
+  }
+  const prefix = /^\s*-\s*\[[^\]\n]\]\s+(?:\d{4}-\d{2}-\d{2}\s+)?(\d{1,2}):(\d{2})/u.exec(line);
+  return prefix === null ? null : toMinutes(prefix[1], prefix[2]);
+}
+
+/** Minutes after midnight, or `null` when the pair is not a clock time. */
+function toMinutes(hours: string, minutes: string): number | null {
+  const h = Number(hours), m = Number(minutes);
+  if (!Number.isInteger(h) || !Number.isInteger(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return h * 60 + m;
+}
+
+/**
  * Drops every scheduling mark from a line, and nothing else: the date and time
  * fields the ruler writes (Dataview, Tasks emoji, Kanban braces, and the
  * `simple` prefix), plus the duration that only describes them. `due`, `start`,
