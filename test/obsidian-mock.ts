@@ -131,12 +131,29 @@ export class MockVault {
   }
 }
 
+/** The status bar item, with the few methods the plugin uses on it. */
+class StatusBarStub {
+  text = "";
+  attrs: Record<string, string> = {};
+  style: Record<string, string> = {};
+  onclick: (() => void) | null = null;
+  setText(text: string): void { this.text = text; }
+  setAttr(name: string, value: string): void { this.attrs[name] = value; }
+  addClass(): void {}
+}
+
 /** The slice of `App` the plugin touches. */
 export function createApp(vault: MockVault): any {
   return {
     vault,
     plugins: { getPlugin: () => undefined },
     commands: { executeCommandById: async () => undefined, commands: {} },
+    workspace: {
+      // The plugin audits the notes once the workspace is ready; in the test
+      // there is no layout, so the callback runs at once.
+      onLayoutReady: (callback: () => unknown) => { void callback(); },
+      getLeaf: () => ({ openFile: async () => undefined }),
+    },
   };
 }
 
@@ -174,6 +191,7 @@ export class Plugin {
   }
   addCommand(): void {}
   addSettingTab(): void {}
+  addStatusBarItem(): any { return new StatusBarStub(); }
   registerEvent(): void {}
   async loadData(): Promise<unknown> { return {}; }
   async saveData(): Promise<void> {}

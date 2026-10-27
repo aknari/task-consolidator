@@ -593,6 +593,71 @@ async function main(): Promise<void> {
     checkTrue('and nothing beyond the drag was written', writes === 1);
   }
 
+  console.log('\nA marker typed over: the run says what it cannot read, and changes nothing');
+
+  {
+    resetNotices();
+    const vault = seedVault();
+    const broken = vault.content(YESTERDAY_PATH).replace('tasks:end -->', 'tasks:endū-->');
+    vault.seed(YESTERDAY_PATH, broken);
+
+    await startRun(vault);
+
+    checkTrue('the notice names the note and the line', notices.some((n) => n.includes('2026-09-17.md, line') && n.includes('not read')));
+    checkTrue('the tasks stay in the source', vault.content(YESTERDAY_PATH).includes(PLAIN_TASK));
+    checkTrue('no copy was invented in today\'s note', !vault.content(TODAY_PATH).includes(PLAIN_TASK));
+    checkTrue('and nothing was marked as moved', !vault.content(YESTERDAY_PATH).includes('task-consolidator:moved'));
+  }
+
+  console.log('\nThe same run, after the marker is repaired: the tasks move');
+
+  {
+    resetNotices();
+    const vault = seedVault();
+    vault.seed(YESTERDAY_PATH, vault.content(YESTERDAY_PATH).replace('tasks:end -->', 'tasks:endū-->'));
+    await startRun(vault);
+
+    vault.seed(YESTERDAY_PATH, vault.content(YESTERDAY_PATH).replace('tasks:endū-->', 'tasks:end -->'));
+    await startRun(vault);
+
+    checkTrue('the repaired note is read', vault.content(TODAY_PATH).includes(PLAIN_TASK));
+    checkTrue('and its task is marked as moved', vault.content(YESTERDAY_PATH).includes('- [>] Pasar palabras'));
+  }
+
+  console.log('\nA broken note of today: the run is not finished, so the day is not consumed');
+
+  {
+    resetNotices();
+    const vault = seedVault();
+    vault.seed(TODAY_PATH, TEMPLATE_TODAY.replace('tasks:end -->', 'tasks:endū-->'));
+    const plugin = await loadPlugin(vault);
+
+    const completed = await plugin.runAutomaticConsolidation();
+
+    checkTrue('the run reports that it did not finish', completed === false);
+    checkTrue('nothing was written into today\'s note', !vault.content(TODAY_PATH).includes(PLAIN_TASK));
+    checkTrue('the source keeps its task', vault.content(YESTERDAY_PATH).includes(PLAIN_TASK));
+    checkTrue('and the status bar counts the problem', plugin.statusBarEl.text === '⚠ 1');
+  }
+
+  console.log('\nThe same typo, caught while the note is being written');
+
+  {
+    resetNotices();
+    const vault = seedVault();
+    vault.emitEvents = true;
+    const plugin = await loadPlugin(vault, { autoConsolidate: false });
+    plugin.markerCheckDelayMs = 20;
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+    const yesterday = vault.getAbstractFileByPath(YESTERDAY_PATH)!;
+    await vault.modify(yesterday, vault.content(YESTERDAY_PATH).replace('tasks:end -->', 'tasks:endū-->'));
+    await sleep(120);
+
+    checkTrue('the write is announced without waiting for a run', notices.some((n) => n.includes('2026-09-17.md, line') && n.includes('does not match')));
+    checkTrue('and it is not announced twice', notices.filter((n) => n.includes('2026-09-17.md, line')).length === 1);
+  }
+
   console.log(`\n${checks} checks passed\n`);
 }
 

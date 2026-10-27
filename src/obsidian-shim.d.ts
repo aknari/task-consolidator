@@ -1,10 +1,18 @@
 interface HTMLElement {
     empty(): void;
     createEl(tag: string, options?: { text?: string }): HTMLElement;
+    setText(text: string): void;
+    setAttr(name: string, value: string): void;
+    addClass(cls: string): void;
 }
 
 declare module "obsidian" {
-  export class App { vault: Vault; plugins: Plugins; commands: Commands; }
+  export class App { vault: Vault; plugins: Plugins; commands: Commands; workspace: Workspace; }
+  export class Workspace {
+    onLayoutReady(callback: () => unknown): void;
+    getLeaf(newLeaf?: boolean): WorkspaceLeaf;
+  }
+  export class WorkspaceLeaf { openFile(file: TFile): Promise<void>; }
   export class Plugins { getPlugin(id: string): unknown; }
   export class Commands { executeCommandById(id: string): Promise<void>; commands: Record<string, unknown>; }
   export class Vault {
@@ -18,6 +26,7 @@ declare module "obsidian" {
     on(event: "create", callback: (file: TFile) => unknown): unknown;
     on(event: "modify", callback: (file: TFile) => unknown): unknown;
     on(event: "rename", callback: (file: TAbstractFile, oldPath: string) => unknown): unknown;
+    on(event: "delete", callback: (file: TAbstractFile) => unknown): unknown;
   }
   export class TAbstractFile { path: string; name: string; }
   export class TFile extends TAbstractFile { basename: string; extension: string; }
@@ -26,6 +35,7 @@ declare module "obsidian" {
     app: App;
     addCommand(command: { id: string; name: string; callback: () => void }): void;
     addSettingTab(tab: PluginSettingTab): void;
+    addStatusBarItem(): HTMLElement;
     loadData(): Promise<unknown>;
     saveData(data: unknown): Promise<void>;
     registerEvent(eventRef: unknown): void;

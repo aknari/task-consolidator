@@ -14,6 +14,7 @@ import {
 } from "./lines";
 import { findMarkerBlock, isSchedulingOnlyChange, reconcileSections, type MarkerBlock, type ReconcileOptions } from "./sections";
 import { AUTO_VERIFY_MS, autoRunDelay, survivors } from "./auto-run";
+import { findMarkerProblems, type MarkerPair, type MarkerProblem } from "./markers";
 import {
   buildWeeklySummary,
   composeWeeklyBody,
@@ -179,6 +180,18 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * itself (see `maybeAutoReconcile`).
    */
   private lastContent = new Map<string, string>();
+  /** Marker problems in the notes this plugin reads, by path, for the status bar. */
+  private markerProblems = new Map<string, MarkerProblem[]>();
+  /** Problems already announced for a note, so a typo is announced once, not per keystroke. */
+  private announcedProblems = new Map<string, string>();
+  /** Pending marker checks, by path: a write is checked after it settles. */
+  private markerTimers = new Map<string, number>();
+  /** Quiet time before a written note is checked for broken markers. */
+  private markerCheckDelayMs = 2500;
+  /** True when the last automatic run could not read part of its input. */
+  private autoBlockedByMarkers = false;
+  /** Status bar item showing outstanding marker problems; hidden when there are none. */
+  private statusBarEl: HTMLElement | null = null;
 
   async onload(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -192,9 +205,29 @@ export default class TaskConsolidatorPlugin extends Plugin {
     this.addCommand({ id: "migrate-daily-material", name: "Migrate previous daily notes material", callback: () => this.migratePreviousMaterial() });
     this.addCommand({ id: "archive-old-daily-notes", name: "Archive old daily notes", callback: () => this.archiveOldDailyNotes() });
     this.addSettingTab(new TaskConsolidatorSettingTab(this.app, this));
-    this.registerEvent(this.app.vault.on("create", (file) => { void this.maybeAutoConsolidate(file); void this.maybeAutoReconcile(file); }));
-    this.registerEvent(this.app.vault.on("modify", (file) => { void this.maybeAutoConsolidate(file); void this.maybeAutoReconcile(file); }));
-    this.registerEvent(this.app.vault.on("rename", (file) => { if (file instanceof TFile) void this.maybeAutoConsolidate(file); }));
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.style.display = "none";
+    this.statusBarEl.onclick = () => { void this.openFirstMarkerProblem(); };
+    this.registerEvent(this.app.vault.on("create", (file) => { void this.maybeAutoConsolidate(file); void this.maybeAutoReconcile(file); this.scheduleMarkerCheck(file); }));
+    this.registerEvent(this.app.vault.on("modify", (file) => { void this.maybeAutoConsolidate(file); void this.maybeAutoReconcile(file); this.scheduleMarkerCheck(file); }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (!(file instanceof TFile)) return;
+      this.markerProblems.delete(oldPath);
+      this.announcedProblems.delete(oldPath);
+      const pending = this.markerTimers.get(oldPath);
+      if (pending !== undefined) window.clearTimeout(pending);
+      this.markerTimers.delete(oldPath);
+      void this.maybeAutoConsolidate(file);
+      this.scheduleMarkerCheck(file);
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      this.markerProblems.delete(file.path);
+      this.announcedProblems.delete(file.path);
+      this.updateStatusBar();
+    }));
+    this.app.workspace.onLayoutReady(() => {
+      void this.auditDailyNotes().catch((error) => console.error("Task Consolidator: the marker audit failed", error));
+    });
     await this.captureTodayNote();
   }
 
@@ -221,8 +254,10 @@ export default class TaskConsolidatorPlugin extends Plugin {
   onunload(): void {
     if (this.reconcileTimer !== null) window.clearTimeout(this.reconcileTimer);
     if (this.autoTimer !== null) window.clearTimeout(this.autoTimer);
+    for (const pending of this.markerTimers.values()) window.clearTimeout(pending);
     this.reconcileTimer = null;
     this.autoTimer = null;
+    this.markerTimers.clear();
   }
 
   async saveSettings(): Promise<void> { await this.saveData(this.settings); }
@@ -255,6 +290,160 @@ export default class TaskConsolidatorPlugin extends Plugin {
       if (content.split(end).length > 2) errors.push(`${name}: duplicate end marker`);
     }
     return errors;
+  }
+
+  /** The six managed pairs, named the way the settings and the messages name them. */
+  private markerPairs(): MarkerPair[] {
+    return [
+      { name: "tasks", start: this.settings.tasksMarkerStart, end: this.settings.tasksMarkerEnd },
+      { name: "plan", start: this.settings.planMarkerStart, end: this.settings.planMarkerEnd },
+      { name: "cancelled", start: this.settings.cancelledMarkerStart, end: this.settings.cancelledMarkerEnd },
+      { name: "reminders", start: this.settings.remindersMarkerStart, end: this.settings.remindersMarkerEnd },
+      { name: "notes", start: this.settings.notesMarkerStart, end: this.settings.notesMarkerEnd },
+      { name: "weekly", start: this.settings.weeklyMarkerStart, end: this.settings.weeklyMarkerEnd },
+    ];
+  }
+
+  private problemsIn(content: string): MarkerProblem[] {
+    return findMarkerProblems(content, this.markerPairs());
+  }
+
+  /**
+   * The notes one run reads: today's, plus the previous ones it scans. The
+   * status bar and the write-time check use the same window, so the problems
+   * that are reported are the ones that would affect a run.
+   */
+  private async dailyNoteWindow(): Promise<DailyNote[]> {
+    const today = window.moment().format("YYYY-MM-DD");
+    return (await this.getDailyNotes()).filter((note) => note.date <= today).slice(0, this.settings.daysToScan + 1);
+  }
+
+  /**
+   * Reads a set of notes and records what is wrong with their markers. Returns
+   * the notes that cannot be read, which is what a caller has to report: a run
+   * that skips one of them is not the same thing as a run with nothing to do.
+   */
+  private async auditNotes(notes: DailyNote[], announce = false): Promise<Array<{ note: DailyNote; problems: MarkerProblem[] }>> {
+    const found: Array<{ note: DailyNote; problems: MarkerProblem[] }> = [];
+    for (const note of notes) {
+      let problems: MarkerProblem[] = [];
+      try {
+        problems = this.problemsIn(await this.app.vault.read(note.file));
+      } catch (error) {
+        console.error("Task Consolidator: a note could not be read for the marker check", note.file.path, error);
+        continue;
+      }
+      if (problems.length === 0) {
+        this.markerProblems.delete(note.file.path);
+        this.announcedProblems.delete(note.file.path);
+        continue;
+      }
+      this.markerProblems.set(note.file.path, problems);
+      found.push({ note, problems });
+      if (announce) this.announceProblems(note, problems);
+    }
+    this.updateStatusBar();
+    return found;
+  }
+
+  private async auditDailyNotes(): Promise<void> {
+    await this.auditNotes(await this.dailyNoteWindow());
+  }
+
+  /** Says a problem once per note and version of it, not once per keystroke. */
+  private announceProblems(note: DailyNote, problems: MarkerProblem[]): void {
+    const signature = this.problemSignature(problems);
+    if (this.announcedProblems.get(note.file.path) === signature) return;
+    this.announcedProblems.set(note.file.path, signature);
+    const extra = problems.length > 1 ? ` (+${problems.length - 1} more in this note)` : "";
+    new Notice(`Task Consolidator: ${note.file.name}, line ${problems[0].line}: ${problems[0].message}${extra}`);
+  }
+
+  private problemSignature(problems: MarkerProblem[]): string {
+    return problems.map((problem) => `${problem.line}:${problem.kind}:${problem.block ?? ""}`).join("|");
+  }
+
+  /** A one-line description of the first unreadable note, for a notice or a confirmation. */
+  private unreadableSummary(found: Array<{ note: DailyNote; problems: MarkerProblem[] }>): string {
+    if (found.length === 0) return "";
+    const first = found[0];
+    const extra = found.length > 1 ? ` (+${found.length - 1} more note(s))` : "";
+    return ` ${first.note.file.name}, line ${first.problems[0].line}: ${first.problems[0].message}${extra}.`;
+  }
+
+  private updateStatusBar(): void {
+    const el = this.statusBarEl;
+    if (el === null) return;
+    const entries = [...this.markerProblems.entries()];
+    const total = entries.reduce((count, [, problems]) => count + problems.length, 0);
+    if (total === 0) {
+      el.style.display = "none";
+      el.setText("");
+      el.setAttr("aria-label", "");
+      return;
+    }
+    el.style.display = "";
+    el.setText(`⚠ ${total}`);
+    el.setAttr("aria-label", entries.map(([path, problems]) => {
+      const name = path.split("/").pop() ?? path;
+      return `${name}: ${problems.map((problem) => `line ${problem.line} ${problem.message}`).join("; ")}`;
+    }).join("\n"));
+  }
+
+  private async openFirstMarkerProblem(): Promise<void> {
+    const path = [...this.markerProblems.keys()][0];
+    if (path === undefined) return;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  /** Checks a written note once it has settled; a marker typed over is caught while it is being written. */
+  private scheduleMarkerCheck(file: TFile): void {
+    if (file.extension !== "md") return;
+    const pending = this.markerTimers.get(file.path);
+    if (pending !== undefined) window.clearTimeout(pending);
+    this.markerTimers.set(file.path, window.setTimeout(() => {
+      this.markerTimers.delete(file.path);
+      void this.checkNoteMarkers(file);
+    }, this.markerCheckDelayMs));
+  }
+
+  private async checkNoteMarkers(file: TFile): Promise<void> {
+    const folder = this.settings.dailyNotesFolder.replace(/\/+$/, "");
+    if (!file.path.startsWith(`${folder}/`)) return;
+    const match = file.basename.match(/^(\d{4}-\d{2}-\d{2})$/);
+    if (match === null) return;
+    const date = match[1];
+    if (!(await this.dailyNoteWindow()).some((note) => note.date === date)) {
+      this.markerProblems.delete(file.path);
+      this.announcedProblems.delete(file.path);
+      this.updateStatusBar();
+      return;
+    }
+    let problems: MarkerProblem[] = [];
+    try {
+      problems = this.problemsIn(await this.app.vault.read(file));
+    } catch (error) {
+      console.error("Task Consolidator: a note could not be read for the marker check", file.path, error);
+      return;
+    }
+    const wasBroken = (this.markerProblems.get(file.path)?.length ?? 0) > 0;
+    if (problems.length === 0) {
+      this.markerProblems.delete(file.path);
+      this.announcedProblems.delete(file.path);
+      this.updateStatusBar();
+      // A note that was repaired: if a run stopped because of it, try again
+      // now instead of making you remember to run the command.
+      if (wasBroken && this.autoBlockedByMarkers && this.settings.autoConsolidate) {
+        this.autoBlockedByMarkers = false;
+        this.autoRanToday = null;
+        this.armAutoRun(window.moment().format("YYYY-MM-DD"));
+      }
+      return;
+    }
+    this.markerProblems.set(file.path, problems);
+    this.updateStatusBar();
+    this.announceProblems({ file, date }, problems);
   }
 
   private async currentDailyNote(): Promise<DailyNote | null> {
@@ -393,9 +582,15 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const current = await this.currentDailyNote();
     if (current === null) { new Notice("Task Consolidator: today's daily note was not found."); return; }
     const currentContent = await this.app.vault.read(current.file);
-    const errors = this.validateManagedBlocks(currentContent);
-    if (errors.length > 0) { new Notice(`Task Consolidator: cannot preview; ${errors.join("; ")}`); return; }
+    const ownProblems = this.problemsIn(currentContent);
+    if (ownProblems.length > 0) {
+      this.markerProblems.set(current.file.path, ownProblems);
+      this.updateStatusBar();
+      this.announceProblems(current, ownProblems);
+      return;
+    }
     const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
+    const unreadable = await this.auditNotes(notes);
     const pending = await this.planMoves(notes, "pending");
     const cancelled = this.settings.includeCancelled ? await this.planMoves(notes, "cancelled") : this.emptyResult();
     const noteCount = new Set([...pending.sources.keys(), ...cancelled.sources.keys()]).size;
@@ -410,7 +605,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
         ? " The empty weekly section left by the template would be removed."
         : "";
     const operon = await operonInfo(this);
-    new Notice(`Task Consolidator: ${parts.join(", ")} to move from ${noteCount} previous note(s).${weeklyNote} ${operon.present ? operon.detail : "Operon not enabled."}`);
+    new Notice(`Task Consolidator: ${parts.join(", ")} to move from ${noteCount} previous note(s).${weeklyNote}${this.unreadableSummary(unreadable)} ${operon.present ? operon.detail : "Operon not enabled."}`);
     console.info("Task Consolidator preview", {
       current: current.file.path,
       pending: [...pending.sources.entries()].map(([path, { moves: sourceMoves }]) => ({ path, tasks: sourceMoves.map((move) => move.parent) })),
@@ -424,11 +619,17 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const current = await this.currentDailyNote();
     if (current === null) { new Notice("Task Consolidator: today's daily note was not found."); return; }
     const currentContent = await this.app.vault.read(current.file);
-    const errors = this.validateManagedBlocks(currentContent);
-    if (errors.length > 0) { new Notice(`Task Consolidator: stopped safely; ${errors.join("; ")}`); return; }
+    const ownProblems = this.problemsIn(currentContent);
+    if (ownProblems.length > 0) {
+      this.markerProblems.set(current.file.path, ownProblems);
+      this.updateStatusBar();
+      this.announceProblems(current, ownProblems);
+      return;
+    }
     const block = this.findBlock(currentContent, this.settings.tasksMarkerStart, this.settings.tasksMarkerEnd);
     if (block === null) { new Notice("Task Consolidator: add the tasks marker block to the daily-note template first."); return; }
     const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
+    const unreadable = await this.auditNotes(notes);
     const pending = await this.planMoves(notes, "pending");
     const cancelled = this.settings.includeCancelled ? await this.planMoves(notes, "cancelled") : this.emptyResult();
     // Mirror exactly what will happen: the manual path has no week gate, but it
@@ -447,7 +648,10 @@ export default class TaskConsolidatorPlugin extends Plugin {
       : weekly.kind === "tidy"
         ? " The empty weekly section left by the template will be removed."
         : "";
-    const summary = `${question}${weeklyNote}`;
+    const skipped = unreadable.length === 0
+      ? ""
+      : ` ${unreadable.length} previous note(s) cannot be read and will be skipped.${this.unreadableSummary(unreadable)}`;
+    const summary = `${question}${weeklyNote}${skipped}`;
     new ConfirmationModal(this.app, summary, async () => {
       const weeklyWritten = await this.maybeWriteWeeklySummary(current, false);
       if (!hasMoves) {
@@ -714,8 +918,17 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const previous = (await this.getDailyNotes()).find((note) => note.date < current.date);
     if (previous === undefined) return { intoToday: [], deferred: [], lines: [], previous: null, reason: "no previous daily note found" };
     const source = await this.app.vault.read(previous.file), currentContent = await this.app.vault.read(current.file);
-    const errors = [...this.validateManagedBlocks(source), ...this.validateManagedBlocks(currentContent)];
-    if (errors.length > 0) return { intoToday: [], deferred: [], lines: [], previous, reason: `stopped safely; ${errors.join("; ")}` };
+    const sourceProblems = this.problemsIn(source), currentProblems = this.problemsIn(currentContent);
+    if (sourceProblems.length > 0 || currentProblems.length > 0) {
+      // The manual command has no marker audit of its own: it names the note and
+      // the line here, so "stopped safely" says what stopped it.
+      if (sourceProblems.length > 0) this.markerProblems.set(previous.file.path, sourceProblems);
+      if (currentProblems.length > 0) this.markerProblems.set(current.file.path, currentProblems);
+      this.updateStatusBar();
+      const where = sourceProblems.length > 0 ? previous.file.name : current.file.name;
+      const first = sourceProblems[0] ?? currentProblems[0];
+      return { intoToday: [], deferred: [], lines: [], previous, reason: `stopped safely; ${where}, line ${first.line}: ${first.message}` };
+    }
     const sourceNotes = this.findBlock(source, this.settings.notesMarkerStart, this.settings.notesMarkerEnd);
     const sourceReminders = this.findBlock(source, this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd);
     const currentReminders = this.findBlock(currentContent, this.settings.remindersMarkerStart, this.settings.remindersMarkerEnd);
@@ -1026,26 +1239,41 @@ export default class TaskConsolidatorPlugin extends Plugin {
    * the periodic-notes plugin and a Templater file template apply the daily
    * template, and marking a source on the strength of a copy that a second write
    * removed is how a task ends up with no live copy anywhere.
+   *
+   * Returns false when today's note itself cannot be read: nothing was written,
+   * and the caller leaves the day open so the next write tries again once it is
+   * repaired. A broken *source* is reported and the readable notes are still
+   * consolidated; the return value stays true there, because the run did what it
+   * could and a repaired source re-arms it by itself (see `checkNoteMarkers`).
    */
-  private async runAutomaticConsolidation(): Promise<void> {
+  private async runAutomaticConsolidation(): Promise<boolean> {
     const current = await this.currentDailyNote();
-    if (current === null) return;
-    const currentContent = await this.app.vault.read(current.file);
-    if (this.validateManagedBlocks(currentContent).length > 0) {
-      console.info("Task Consolidator: automatic run skipped; managed markers missing.");
-      return;
+    if (current === null) return true;
+    const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
+    // Read the whole window before writing anything. A note whose markers are
+    // broken is invisible to every step below; saying so is the difference
+    // between "there was nothing to do" and "I could not read it".
+    const unreadable = await this.auditNotes([current, ...notes], true);
+    if ((this.markerProblems.get(current.file.path)?.length ?? 0) > 0) {
+      this.autoBlockedByMarkers = true;
+      return false;
     }
+    this.autoBlockedByMarkers = unreadable.length > 0;
     const material = await this.buildMaterialChanges(current);
     await this.applyMaterialChanges(material.intoToday);
     const weeklyWritten = await this.maybeWriteWeeklySummary(current, true);
-    const notes = (await this.getDailyNotes()).filter((note) => note.date < current.date).slice(0, this.settings.daysToScan);
     const pending = await this.planMoves(notes, "pending");
     const cancelled = this.settings.includeCancelled ? await this.planMoves(notes, "cancelled") : this.emptyResult();
     if (pending.moves.length === 0 && cancelled.moves.length === 0 && material.intoToday.length === 0) {
-      new Notice(`Task Consolidator: automatic run finished; nothing to migrate or consolidate.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
-      return;
+      // With an unreadable note the problem notice already said what happened;
+      // adding "nothing to consolidate" would contradict it.
+      if (unreadable.length === 0) {
+        new Notice(`Task Consolidator: automatic run finished; nothing to migrate or consolidate.${weeklyWritten ? " A weekly summary of the previous week was written." : ""}`);
+      }
+      return true;
     }
     await this.applyConsolidation(current, pending, cancelled, weeklyWritten, { changes: material.deferred, lines: material.lines });
+    return true;
   }
 
   /**
@@ -1082,9 +1310,11 @@ export default class TaskConsolidatorPlugin extends Plugin {
     this.autoTimer = window.setTimeout(() => {
       this.autoTimer = null;
       this.autoArmedAt = 0;
-      this.autoRanToday = today;
       this.autoRunning = true;
       this.runAutomaticConsolidation()
+        // The day is marked done only when the run could read its input. A
+        // silent skip used to consume the one automatic attempt of the day.
+        .then((completed) => { if (completed) this.autoRanToday = today; })
         .catch((error) => console.error("Task Consolidator: automatic run failed", error))
         .finally(() => { this.autoRunning = false; });
     }, delay);
