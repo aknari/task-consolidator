@@ -172,6 +172,63 @@ check(
 check('no inflation from copied-forward lines', readWeeklyTasks(GROUP, READ).length, 2);
 
 // --------------------------------------------------------------------------
+// Scheduling is not part of the week's story
+// --------------------------------------------------------------------------
+// The ruler's primary format writes `h:mm - h:mm` at the start of the task,
+// and a task carried through the week can arrive with a different slot each
+// day. The summary reports what happened, not how it was planned: the slot
+// and the fields that only place it in time go, so the same task is reported
+// once; the created stamp stays.
+const PLANNED: WeeklyNoteInput[] = [
+  {
+    date: '2026-10-13',
+    content: [
+      MARKERS.tasksStart,
+      '- [>] 10:30 - 11:00 Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14',
+      '- [>] 2026-09-17 10:00 - 10:30 Llamar al banco #task ➕ 2026-09-17',
+      '- [>] 9:00 Preparar clase #task',
+      '- [>] Reunión a las 10:00 sobre el presupuesto #task',
+      '- [>] Tarea antigua #task [created:: 2025-01-02]',
+      MARKERS.tasksEnd,
+    ].join('\n'),
+  },
+  {
+    date: '2026-10-14',
+    content: [
+      MARKERS.tasksStart,
+      '- [>] 12:00 - 12:30 Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] [scheduled:: 2026-10-14T12:00] [duration:: 30m] ⏳ 2026-10-14 ➕ 2026-10-14',
+      MARKERS.tasksEnd,
+    ].join('\n'),
+  },
+];
+check(
+  'the time slot and the scheduling fields are left out',
+  readWeeklyTasks(PLANNED, READ).map((t) => [t.text, t.created]),
+  [
+    ['Revisión de informes P2 #materia/principios-electronica', '2026-10-14'],
+    ['Llamar al banco', '2026-09-17'],
+    ['Preparar clase', null],
+    ['Reunión a las 10:00 sobre el presupuesto', null],
+    ['Tarea antigua', '2025-01-02'],
+  ],
+);
+check(
+  'a task carried with a different slot is still one task',
+  readWeeklyTasks(PLANNED, READ).filter((t) => t.text.startsWith('Revisión de informes')).length,
+  1,
+);
+const plannedOut = buildWeeklySummary(PLANNED, RENDER).join('\n');
+check('scheduling: the summary counts each task once', plannedOut.includes('**Pendientes (5)**'), true);
+check('scheduling: the created stamp survives', plannedOut.includes('- Revisión de informes P2 #materia/principios-electronica (➕ 2026-10-14)'), true);
+check('scheduling: an older created field is reported too', plannedOut.includes('- Tarea antigua (➕ 2025-01-02)'), true);
+check('scheduling: the raw created field is not shown', plannedOut.includes('[created::'), false);
+check('scheduling: no clock slot is rendered', /\d{1,2}:\d{2}\s*[-–—]\s*\d{1,2}:\d{2}/u.test(plannedOut), false);
+check('scheduling: no arrival stamp is rendered', plannedOut.includes('⏳'), false);
+check('scheduling: no scheduling field is rendered', /\[(?:scheduled|date|startTime|endTime|allDay|duration)\s*::/u.test(plannedOut), false);
+// Only a prefix is scheduling: a clock time inside the text is the task's own.
+check('scheduling: a time inside the text survives', plannedOut.includes('- Reunión a las 10:00 sobre el presupuesto'), true);
+
+// --------------------------------------------------------------------------
 // Which occurrence of a task describes it
 // --------------------------------------------------------------------------
 // The bug these cases exist for: a task pending earlier in the week and ticked

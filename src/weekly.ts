@@ -88,6 +88,21 @@ const CANCELLED_HEADING = /^tareas canceladas/i;
 const ISO_DATE = /\d{4}-\d{2}-\d{2}/;
 const MULTI_SPACE = /\s+/g;
 
+/**
+ * The scheduling marks the report leaves out: where the work was planned, not
+ * when it appeared. They are the ruler's `simple` prefix — what its primary
+ * format writes, `[YYYY-MM-DD ]h:mm[-h:mm]` at the start of the task — the
+ * Tasks `⏳` date, and the inline fields that only place a task in time.
+ * A created stamp is not scheduling: the `[created::]` form is read into
+ * `created` and reported as `(➕ …)`, because the week's story is when each
+ * task showed up, not the hour it was given.
+ */
+const SIMPLE_PREFIX = /^(?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}(?:\s*[-–—]\s*\d{1,2}:\d{2})?\s+/u;
+const TASKS_SCHEDULED = /\s*⏳\s*\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2})?/gu;
+const SCHEDULE_FIELD = /\s*\[\s*(?:scheduled|date|startTime|endTime|allDay|duration)\s*::\s*[^\]]*?\s*\]/gu;
+/** The older inline form of the `➕` stamp, reported the same way. */
+const CREATED_FIELD = /\s*\[\s*created\s*::\s*[^\]]*?\s*\]/gu;
+
 interface Labels {
   week: (week: number, year: number) => string;
   weekRange: (from: string, to: string) => string;
@@ -235,7 +250,9 @@ function combine(current: Occurrence, candidate: Occurrence): Occurrence {
 
 /** Strips the parts that must never be re-emitted, keeping the text readable. */
 function toInertText(raw: string, taskTag: string): string {
-  let text = raw.replace(/\{\{[^}]*\}\}/g, " ");
+  let text = raw.trimStart().replace(SIMPLE_PREFIX, "");
+  text = text.replace(/\{\{[^}]*\}\}/g, " ");
+  text = text.replace(TASKS_SCHEDULED, "").replace(SCHEDULE_FIELD, "").replace(CREATED_FIELD, "");
   if (taskTag.trim() !== "") {
     const tag = taskTag.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     text = text.replace(new RegExp(`(^|\\s)${tag}(?!\\S)`, "gu"), "$1");
@@ -247,6 +264,7 @@ function toInertText(raw: string, taskTag: string): string {
 function datesOf(raw: string): { created: string | null; completed: string | null } {
   const completed = raw.match(/✅\s*(\d{4}-\d{2}-\d{2})/u) ?? raw.match(/\{\{\s*dateCompleted\s*::\s*([^}]+)\}\}/u);
   const created = raw.match(/➕\s*(\d{4}-\d{2}-\d{2})/u)
+    ?? raw.match(/\[\s*created\s*::\s*([^\]]+)\]/u)
     ?? raw.match(/\{\{\s*datetimeCreated\s*::\s*([^}]+)\}\}/u)
     ?? raw.match(/\{\{\s*dateCreated\s*::\s*([^}]+)\}\}/u)
     ?? raw.match(/\{\{\s*dateStarted\s*::\s*([^}]+)\}\}/u)
