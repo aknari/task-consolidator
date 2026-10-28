@@ -7,9 +7,11 @@
  *
  * Four rules live here, and they have to agree with each other:
  *
- *  - **Plain tasks travel decorated.** The managed tag is appended when the
- *    line does not carry it yet, and a ` ➕ YYYY-MM-DD` stamp records the day
- *    the task came from, unless the line has a ` ➕` date of its own.
+ *  - **Plain tasks travel decorated.** The managed tag is written when the
+ *    line does not carry it yet, at the start of the task text by default — the
+ *    place the Tasks plugin puts it when it creates a task — or at the end if
+ *    the settings say so. A ` ➕ YYYY-MM-DD` stamp records the day the task came
+ *    from, unless the line has a ` ➕` date of its own.
  *  - **A past day's scheduling does not travel.** A task planned for the day
  *    it is leaving keeps a mark that pins it to that day: in a time-ruler
  *    column it lands in the `past` block instead of today's timeline, which is
@@ -38,8 +40,13 @@
  */
 
 export interface LineOptions {
-  /** Tag appended to migrated plain tasks (`#task` by default). Empty adds none. */
+  /** Tag written on migrated plain tasks (`#task` by default). Empty adds none. */
   taskTag: string;
+  /**
+   * Where that tag goes: at the start of the task text (the default, where the
+   * Tasks plugin puts it) or at the end, before any `{{...}}` block.
+   */
+  taskTagPosition?: "start" | "end";
   /** Whether a migrated task records the day it came from (see the file header). */
   stampCreatedDate: boolean;
   /**
@@ -135,6 +142,71 @@ export function normalizeTaskLine(line: string, taskTag: string): string {
 }
 
 /**
+ * The order carried tasks arrive in, which is the order the backlog is read in.
+ *
+ * Priority first — the icons the Tasks plugin writes, highest first — then the
+ * due date, then the day the task came from, so that a week of unprioritised
+ * work keeps the oldest at the top. A line with no priority sorts with the
+ * lowest one, and a line with no date sorts last among its equals: the legacy
+ * script ordered exactly this way, and that is the shape the eye expects at the
+ * top of a backlog.
+ *
+ * Blocks are compared by their **parent** line. An indented step has no
+ * priority of its own — it belongs to the task above it — so nothing here is
+ * meant to be read from a step.
+ */
+const PRIORITY_RANK = new Map([
+  ["🔺", 1],
+  ["⏫", 2],
+  ["🔼", 3],
+  ["🔶", 4],
+  ["🔽", 5],
+  ["⏬", 6],
+]);
+
+/** 1 (highest) to 6 (lowest); no icon ranks as the lowest, as the script had it. */
+export function priorityRank(line: string): number {
+  for (const [icon, rank] of PRIORITY_RANK) if (line.includes(icon)) return rank;
+  return 6;
+}
+
+/** The dates the same task can carry, in the two notations the vault writes. */
+const DUE_DATES = [/📅\s*(\d{4}-\d{2}-\d{2})/u, /\{\{\s*dateDue\s*::\s*([^}]+?)\s*\}\}/u];
+const CREATED_DATES = [
+  /➕\s*(\d{4}-\d{2}-\d{2})/u,
+  /\{\{\s*dateCreated\s*::\s*([^}]+?)\s*\}\}/u,
+  /\{\{\s*datetimeCreated\s*::\s*([^}]+?)\s*\}\}/u,
+  /\[\s*created\s*::\s*([^\]]+?)\s*\]/u,
+];
+
+/** The first `YYYY-MM-DD` any of the patterns finds, or `""` when none does. */
+function isoDate(line: string, patterns: RegExp[]): string {
+  for (const pattern of patterns) {
+    const value = pattern.exec(line)?.[1];
+    if (value !== undefined && /^\d{4}-\d{2}-\d{2}/u.test(value)) return value.slice(0, 10);
+  }
+  return "";
+}
+
+/**
+ * Comparator for the parent lines of carried tasks: priority, then due, then
+ * created. Undated lines go last within their group; a full tie keeps the order
+ * the notes were scanned in, since `Array#sort` is stable.
+ */
+export function carriedOrder(a: string, b: string): number {
+  const byPriority = priorityRank(a) - priorityRank(b);
+  if (byPriority !== 0) return byPriority;
+  for (const patterns of [DUE_DATES, CREATED_DATES]) {
+    const left = isoDate(a, patterns), right = isoDate(b, patterns);
+    if (left === right) continue;
+    if (left === "") return 1;
+    if (right === "") return -1;
+    return left < right ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
  * The identity of a task line, which is what de-duplication and "already in
  * today's note" both mean:
  *
@@ -148,29 +220,59 @@ export function taskKey(line: string, taskTag: string): string {
   return id !== null ? `operon:${id}` : normalizeTaskLine(line, taskTag);
 }
 
+/** A checkbox, the space after it, and the `simple` time prefix that may follow. */
+const CHECKBOX_AND_PREFIX = /^(\s*-\s*\[[^\]\n]\]\s*)((?:(?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}(?:\s*-\s*\d{1,2}:\d{2})?\s+))?/u;
+
+/**
+ * Writes a tag at the start of a task's text, where the Tasks plugin puts the
+ * one it creates itself.
+ *
+ * A `simple`-format time prefix stays in front of it (`- [ ] 09:00 - 09:30
+ * #task Llamar`): the ruler only reads the hour when it follows the checkbox
+ * directly, so a tag pushed in between would turn a planned task into an
+ * unplanned one. Everything else — the text, the fields, the `{{...}}` block —
+ * is left in the order it was written.
+ */
+export function prefixTaskTag(line: string, tag: string): string {
+  const match = CHECKBOX_AND_PREFIX.exec(line);
+  if (match === null) return line;
+  const at = match[1].length + (match[2]?.length ?? 0);
+  const head = line.slice(0, at);
+  const tail = line.slice(at);
+  const space = /\s$/u.test(head) ? "" : " ";
+  return `${head}${space}${tag}${tail === "" ? "" : ` ${tail}`}`;
+}
+
 /**
  * Prepares a migrated pending line for insertion into today's note: `- [!]`
- * becomes `- [ ]`, a scheduling mark of an earlier day is dropped (see
- * `stripPastSchedule`), plain tasks get the managed tag and the source-date
- * stamp, and Operon tasks keep their fields — plus a start date when they have
- * none. `targetDate` is the destination daily note's date (`YYYY-MM-DD`);
- * without it no scheduling is cleared, which is what the callers that only
- * decorate a line within its own note want.
+ * becomes `- [ ] ⏫`, a scheduling mark of an earlier day is dropped (see
+ * `stripPastSchedule`), plain tasks get the managed tag at the start of their
+ * text and the source-date stamp at the end, and Operon tasks keep their fields
+ * — plus a start date when they have none. `targetDate` is the destination
+ * daily note's date (`YYYY-MM-DD`); without it no scheduling is cleared, which
+ * is what the callers that only decorate a line within its own note want.
  */
 export function prepareMigratedLine(line: string, sourceDate: string, options: LineOptions, targetDate = ""): string {
   const source = options.clearPastSchedule !== false && targetDate !== "" ? stripPastSchedule(line, targetDate, sourceDate) : line;
-  const prepared = source.replace(/- \[!\]/u, "- [ ]").trimEnd();
+  // `[!]` is how an important task gets written in a hurry (Task Status), and it
+  // is not a state to keep: the priority icon is what the Tasks plugin sorts and
+  // filters by, so the mark turns into the highest priority and the task takes
+  // the place it asked for at the top of the backlog.
+  let prepared = source.replace(/- \[!\]/u, "- [ ] ⏫").trimEnd();
   if (isOperonLine(prepared)) return options.stampCreatedDate ? stampOperonStart(prepared, sourceDate) : prepared;
-  const braceIdx = prepared.indexOf("{{");
-  const hasBraces = braceIdx >= 0;
-  const parts: string[] = [];
   const tag = options.taskTag.trim();
-  if (tag !== "" && !tagPresent(prepared, tag)) parts.push(tag);
-  if (options.stampCreatedDate && !/\s*➕\s*\d{4}-\d{2}-\d{2}/u.test(prepared)) parts.push(`➕ ${sourceDate}`);
-  if (parts.length === 0) return prepared;
-  const head = hasBraces ? prepared.slice(0, braceIdx).trimEnd() : prepared;
-  const tail = hasBraces ? prepared.slice(braceIdx).trimStart() : "";
-  const suffix = parts.map((part) => ` ${part}`).join("");
+  const addTag = tag !== "" && !tagPresent(prepared, tag);
+  const addStamp = options.stampCreatedDate && !/\s*➕\s*\d{4}-\d{2}-\d{2}/u.test(prepared);
+  if (!addTag && !addStamp) return prepared;
+  if (addTag && (options.taskTagPosition ?? "start") === "start") prepared = prefixTaskTag(prepared, tag);
+  const trailing: string[] = [];
+  if (addTag && options.taskTagPosition === "end") trailing.push(tag);
+  if (addStamp) trailing.push(`➕ ${sourceDate}`);
+  if (trailing.length === 0) return prepared;
+  const braceIdx = prepared.indexOf("{{");
+  const head = braceIdx >= 0 ? prepared.slice(0, braceIdx).trimEnd() : prepared;
+  const tail = braceIdx >= 0 ? prepared.slice(braceIdx).trimStart() : "";
+  const suffix = trailing.map((part) => ` ${part}`).join("");
   return tail === "" ? `${head}${suffix}` : `${head}${suffix} ${tail}`;
 }
 

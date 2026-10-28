@@ -658,6 +658,55 @@ async function main(): Promise<void> {
     checkTrue('and it is not announced twice', notices.filter((n) => n.includes('2026-09-17.md, line')).length === 1);
   }
 
+  console.log('\nThe backlog arrives ordered: priority first, then the day each came from');
+
+  {
+    resetNotices();
+    const vault = new MockVault();
+    vault.seed(
+      YESTERDAY_PATH,
+      dailyNote({
+        tasks: [
+          '- [ ] Mirar los discos SSD externos #task ⏬ ➕ 2026-09-10',
+          '- [ ] Sin prioridad y sin fecha #task',
+          '- [ ] Hablar con Pedro #task 🔺 ➕ 2026-09-15',
+          '- [ ] Preparar la práctica #task 🔼 ➕ 2026-09-12',
+          '  - [ ] Buscar el enunciado #task',
+        ],
+      }),
+    );
+    vault.seed(TODAY_PATH, TEMPLATE_TODAY);
+    vault.seed(REMINDERS_FILE, '# Recordatorios\n');
+    vault.seed(NOTES_FILE, '# Apuntes\n');
+
+    await startRun(vault);
+
+    const backlog = section(vault.content(TODAY_PATH), BACKLOG);
+    const at = (needle: string): number => backlog.findIndex((line) => line.includes(needle));
+    checkTrue('the highest priority is written first', at('Hablar con Pedro') === 0);
+    checkTrue('the next one down follows it', at('Preparar la práctica') === 1);
+    checkTrue('the lowest priority goes after them', at('Mirar los discos') === 3);
+    checkTrue('a task with no priority and no date goes last', at('Sin prioridad') === 4);
+    checkTrue('and a step stays under the task it belongs to', backlog[2]?.includes('Buscar el enunciado') === true);
+  }
+
+  console.log('\nAn important task is carried as a top-priority one');
+
+  {
+    resetNotices();
+    const vault = new MockVault();
+    vault.seed(YESTERDAY_PATH, dailyNote({ tasks: ['- [!] Remitir el acta #task ➕ 2026-09-14'] }));
+    vault.seed(TODAY_PATH, TEMPLATE_TODAY);
+    vault.seed(REMINDERS_FILE, '# Recordatorios\n');
+    vault.seed(NOTES_FILE, '# Apuntes\n');
+
+    await startRun(vault);
+
+    const backlog = section(vault.content(TODAY_PATH), BACKLOG);
+    checkTrue('the mark becomes the highest priority', backlog.some((line) => line.includes('- [ ] ⏫ Remitir el acta')));
+    checkTrue('and the source keeps the record of it', vault.content(YESTERDAY_PATH).includes('- [>] Remitir el acta'));
+  }
+
   console.log(`\n${checks} checks passed\n`);
 }
 

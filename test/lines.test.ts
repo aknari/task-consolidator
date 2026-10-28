@@ -21,12 +21,15 @@
  */
 import assert from 'node:assert/strict';
 import {
+  carriedOrder,
   hasOperonField,
   insertOperonField,
   isOperonLine,
   normalizeTaskLine,
   operonId,
   prepareMigratedLine,
+  prefixTaskTag,
+  priorityRank,
   scheduledDate,
   stampOperonStart,
   stripPastSchedule,
@@ -122,15 +125,27 @@ check(
 );
 check('a cancelled Operon task gets no start date', stampOperonStart(OPERON_CANCELLED, DATE), OPERON_CANCELLED);
 check(
-  'a plain task gets the tag and the source date',
+  'a plain task gets the tag at the start of its text and the source date at the end',
   prepareMigratedLine('- [ ] Mirar la práctica 1', DATE, OPTIONS),
-  '- [ ] Mirar la práctica 1 #task ➕ 2026-09-16',
+  '- [ ] #task Mirar la práctica 1 ➕ 2026-09-16',
 );
 check('a task that already carries both is untouched', prepareMigratedLine(PLAIN, DATE, OPTIONS), PLAIN);
+// A tag already on the line is left exactly where it was written: this only
+// writes one when the line has none, it never moves yours.
 check(
-  '`- [!]` is carried into today as `- [ ]`, tagged twice never',
+  '`- [!]` is carried into today as `- [ ] ⏫`, tagged twice never',
   prepareMigratedLine(PLAIN_IMPORTANT, DATE, OPTIONS),
-  '- [ ] Mirar el vuelo de Riga a Gran Canaria #task ➕ 2026-09-16',
+  '- [ ] ⏫ Mirar el vuelo de Riga a Gran Canaria #task ➕ 2026-09-16',
+);
+check(
+  'the tag can be written at the end of the line instead',
+  prepareMigratedLine('- [ ] Mirar la práctica 1', DATE, { ...OPTIONS, taskTagPosition: 'end' }),
+  '- [ ] Mirar la práctica 1 #task ➕ 2026-09-16',
+);
+check(
+  'an empty tag setting writes no tag at all',
+  prepareMigratedLine('- [ ] Mirar la práctica 1', DATE, { ...OPTIONS, taskTag: '' }),
+  '- [ ] Mirar la práctica 1 ➕ 2026-09-16',
 );
 check(
   'the stamp can be turned off',
@@ -140,7 +155,27 @@ check(
 check(
   'a plain task before a `{{...}}` block keeps the block at the end',
   prepareMigratedLine('- [ ] X {{foo:: bar}}', DATE, OPTIONS),
-  '- [ ] X #task ➕ 2026-09-16 {{foo:: bar}}',
+  '- [ ] #task X ➕ 2026-09-16 {{foo:: bar}}',
+);
+check(
+  'the tag goes after a `simple` time prefix, which the ruler reads only there',
+  prefixTaskTag('- [ ] 09:00 - 09:30 Llamar al banco', '#task'),
+  '- [ ] 09:00 - 09:30 #task Llamar al banco',
+);
+check(
+  'a dated prefix keeps the tag behind it too',
+  prefixTaskTag('- [ ] 2026-10-20 09:00 - 09:30 Llamar al banco', '#task'),
+  '- [ ] 2026-10-20 09:00 - 09:30 #task Llamar al banco',
+);
+check(
+  'an indented subtask is tagged after its own indent',
+  prefixTaskTag('  - [ ] Repasar el tema 3', '#task'),
+  '  - [ ] #task Repasar el tema 3',
+);
+check(
+  'a task with no text at all still gets its space and its tag',
+  prefixTaskTag('- [ ]', '#task'),
+  '- [ ] #task',
 );
 check('hasOperonField sees dateStarted', hasOperonField(OPERON, 'dateStarted'), false);
 check(
@@ -296,22 +331,37 @@ check(
 check(
   'the ➕ stamp of the day it came from is added when the line has none',
   prepareMigratedLine('- [ ] Mirar la práctica 1 ⏳ 2026-10-14', SOURCE, OPTIONS, TARGET),
-  '- [ ] Mirar la práctica 1 #task ➕ 2026-10-15',
+  '- [ ] #task Mirar la práctica 1 ➕ 2026-10-15',
 );
 check(
   'the setting turns the clearing off',
   prepareMigratedLine('- [ ] Mirar la práctica 1 ⏳ 2026-10-14', SOURCE, { ...OPTIONS, clearPastSchedule: false }, TARGET),
-  '- [ ] Mirar la práctica 1 ⏳ 2026-10-14 #task ➕ 2026-10-15',
+  '- [ ] #task Mirar la práctica 1 ⏳ 2026-10-14 ➕ 2026-10-15',
 );
 check(
   'without a destination date the line is only decorated',
   prepareMigratedLine('- [ ] Mirar la práctica 1 ⏳ 2026-10-14', SOURCE, OPTIONS),
-  '- [ ] Mirar la práctica 1 ⏳ 2026-10-14 #task ➕ 2026-10-15',
+  '- [ ] #task Mirar la práctica 1 ⏳ 2026-10-14 ➕ 2026-10-15',
+);
+check(
+  'a surviving time prefix keeps the tag behind it, never in between',
+  prepareMigratedLine('- [ ] 09:00 - 09:30 Llamar al banco', SOURCE, { ...OPTIONS, clearPastSchedule: false }, TARGET),
+  '- [ ] 09:00 - 09:30 #task Llamar al banco ➕ 2026-10-15',
 );
 check(
   'a migrated line with a prefix arrives cleared too',
   prepareMigratedLine(ALREADY_TODAY, SOURCE, OPTIONS, TARGET),
   '- [ ] Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14',
+);
+check(
+  'an important task arrives as a top-priority one, which is what Tasks sorts by',
+  prepareMigratedLine('- [!] Remitir el acta de #materia/electronica-buque ➕ 2026-10-13', SOURCE, OPTIONS, TARGET),
+  '- [ ] #task ⏫ Remitir el acta de #materia/electronica-buque ➕ 2026-10-13',
+);
+check(
+  'and its tombstone is the same record as any other',
+  tombstoneLine('- [!] Remitir el acta ➕ 2026-10-13'),
+  '- [>] Remitir el acta ➕ 2026-10-13',
 );
 check(
   'the tombstone left in the source note keeps the record',
@@ -323,6 +373,49 @@ check(
   tombstoneLine(ALREADY_TODAY),
   '- [>] 12:00 - 12:30 Revisión de informes P2 #materia/principios-electronica #task [created:: 2026-10-13] ➕ 2026-10-14',
 );
+
+// --------------------------------------------------------------------------
+// The order carried tasks arrive in
+// --------------------------------------------------------------------------
+// What the legacy script did, and what the backlog is read in: priority, then
+// due date, then the day the task came from. These are lines written the way the
+// vault writes them.
+const LOWEST = '- [ ] #task Mirar los discos SSD externos ⏬ ➕ 2026-10-27';
+const TOP = '- [ ] #task Hablar con Pedro, Moisés y José. 🔺 ➕ 2026-10-27 📅 2026-10-28';
+const HIGH = '- [ ] #task Mirar lo de Erasmus+ 🔼 ➕ 2026-10-27';
+const UNDATED = '- [ ] Pedir a Margarita y a Juan Manuel los datos de estudiantes de prácticas';
+const OPERON_DUE = '- [ ] Leer el libro {{operonId:: twcd222}} {{dateDue:: 2026-09-20}}';
+
+check('priority ranks from highest to lowest', [TOP, HIGH, LOWEST].map((line) => priorityRank(line)), [1, 3, 6]);
+check('a line with no priority ranks with the lowest', priorityRank(UNDATED), 6);
+check(
+  'carried tasks arrive by priority, then due date, then the day they came from',
+  [UNDATED, LOWEST, OPERON_DUE, HIGH, TOP].sort((a, b) => carriedOrder(a, b)),
+  [TOP, HIGH, OPERON_DUE, LOWEST, UNDATED],
+);
+// The lowest icon and no icon rank together, as they did in the script: between
+// them the due date decides, and a line with no priority but a due date comes
+// before one marked `⏬` without it.
+check('the lowest priority and no priority rank together', [priorityRank(LOWEST), priorityRank(OPERON_DUE)], [6, 6]);
+check(
+  'the same priority is split by due date, earliest first',
+  [OPERON_DUE, '- [ ] #task Otra {{dateDue:: 2026-10-30}}'].sort((a, b) => carriedOrder(a, b)),
+  [OPERON_DUE, '- [ ] #task Otra {{dateDue:: 2026-10-30}}'],
+);
+check(
+  'with no priority and no due date, the oldest task comes first',
+  [
+    '- [ ] Reciente #task ➕ 2026-10-27',
+    '- [ ] Antigua #task ➕ 2024-12-17',
+    '- [ ] Con fecha propia [created:: 2025-01-13] #task',
+  ].sort((a, b) => carriedOrder(a, b)),
+  [
+    '- [ ] Antigua #task ➕ 2024-12-17',
+    '- [ ] Con fecha propia [created:: 2025-01-13] #task',
+    '- [ ] Reciente #task ➕ 2026-10-27',
+  ],
+);
+check('two identical keys keep the order they were scanned in', carriedOrder(HIGH, HIGH), 0);
 
 if (failed > 0) {
   console.error(`\n${failed} check(s) failed`);

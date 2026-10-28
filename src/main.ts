@@ -1,6 +1,7 @@
 import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
 import { operonInfo, requestOperonReindex } from "./operon";
 import {
+  carriedOrder,
   isOperonLine,
   normalizeTaskLine,
   prepareMigratedLine,
@@ -38,6 +39,7 @@ interface TaskConsolidatorSettings {
   autoConsolidate: boolean;
   includeCancelled: boolean;
   taskTag: string;
+  taskTagPosition: "start" | "end";
   stampCreatedDate: boolean;
   clearPastSchedule: boolean;
   autoReconcile: boolean;
@@ -87,6 +89,7 @@ const DEFAULT_SETTINGS: TaskConsolidatorSettings = {
   autoConsolidate: true,
   includeCancelled: true,
   taskTag: "#task",
+  taskTagPosition: "start",
   stampCreatedDate: true,
   clearPastSchedule: true,
   autoReconcile: true,
@@ -132,7 +135,7 @@ interface DeferredRun {
 interface PlannedMove {
   /** Normalized key of the parent line, used for de-duplication. */
   key: string;
-  /** Parent line normalized for insertion (`- [!]` becomes `- [ ]`). */
+  /** Parent line normalized for insertion (`- [!]` becomes `- [ ] ⏫`). */
   parent: string;
   /** Original lines to move: the parent plus any contiguous indented subtask lines. */
   lines: string[];
@@ -458,6 +461,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
   private lineOptions(): LineOptions {
     return {
       taskTag: this.taskTag(),
+      taskTagPosition: this.settings.taskTagPosition === "end" ? "end" : "start",
       stampCreatedDate: this.settings.stampCreatedDate,
       clearPastSchedule: this.settings.clearPastSchedule,
     };
@@ -751,7 +755,9 @@ export default class TaskConsolidatorPlugin extends Plugin {
     const plan = this.findBlock(content, this.settings.planMarkerStart, this.settings.planMarkerEnd);
     const existingKeys = this.existingTaskKeys(lines, block, current.date, plan);
     const options = this.lineOptions();
-    const toBacklog: string[] = [];
+    // Blocks, not lines: a task and the steps indented under it travel and are
+    // ordered as one unit, so sorting the flat lines would separate them.
+    const toBacklog: string[][] = [];
     const toPlan: string[] = [];
     const insertedKeys: string[] = [];
     for (const move of moves) {
@@ -781,14 +787,19 @@ export default class TaskConsolidatorPlugin extends Plugin {
       // it always did. This is the same rule a manual pass applies to the note,
       // which is what makes the two agree.
       const planned = kind === "pending" && plan !== null && scheduledDate(insertLines[0], current.date) === current.date;
-      (planned ? toPlan : toBacklog).push(...insertLines);
+      if (planned) toPlan.push(...insertLines);
+      else toBacklog.push(insertLines);
     }
     if (toBacklog.length === 0 && toPlan.length === 0) return { inserted: 0, blockFound: true, keys: [] };
+    // The backlog is read top down, so the work that matters arrives first:
+    // priority, then due date, then the day each task came from. The plan is
+    // left alone — its order is the clock, and `reconcileSections` imposes it.
+    const backlog = toBacklog.sort((a, b) => carriedOrder(a[0] ?? "", b[0] ?? "")).flat();
     const out = content.split("\n");
     // Higher line indexes first, so a splice never moves the range of the other
     // block. Usually the plan sits above the backlog, but nothing promises it.
     const insertions = [
-      { at: block.end, lines: toBacklog },
+      { at: block.end, lines: backlog },
       ...(plan === null ? [] : [{ at: plan.end, lines: toPlan }]),
     ].filter((insertion) => insertion.lines.length > 0).sort((a, b) => b.at - a.at);
     for (const insertion of insertions) out.splice(insertion.at, 0, ...insertion.lines);
@@ -797,7 +808,7 @@ export default class TaskConsolidatorPlugin extends Plugin {
     // line that changed hands while the note was open, say).
     const reconciled = reconcileSections(out.join("\n"), this.reconcileOptions(current.date));
     await this.app.vault.modify(current.file, reconciled?.content ?? out.join("\n"));
-    return { inserted: toBacklog.length + toPlan.length, blockFound: true, keys: insertedKeys };
+    return { inserted: backlog.length + toPlan.length, blockFound: true, keys: insertedKeys };
   }
 
   /**
@@ -1384,7 +1395,8 @@ class TaskConsolidatorSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Weekly summary of the previous week").setDesc("When the first daily note of a new week is created, write a report of the previous week's daily notes (pending, completed and cancelled tasks) inside the weekly marker block. The report is inert — no checkboxes, no task metadata, no task tag — so it is never consolidated. The template's heading is carried over, and whenever no report is due — the other days of the week, or this setting being off — the untouched section is emptied, so the template's heading never hangs empty in the note. An existing summary, or text of your own, is never overwritten.").addToggle((toggle) => toggle.setValue(this.plugin.settings.weeklySummary).onChange(async (value) => { this.plugin.settings.weeklySummary = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Weekly summary language").setDesc("Language of the weekly summary text. Task lines are copied verbatim in whatever language you wrote them.").addDropdown((dropdown) => dropdown.addOption("es", "Español").addOption("en", "English").setValue(this.plugin.settings.weeklyLanguage).onChange(async (value) => { this.plugin.settings.weeklyLanguage = value === "en" ? "en" : "es"; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Include cancelled tasks").setDesc("Move tasks marked cancelled (- [-]) from previous notes into today's '## Tareas canceladas' block. Completed tasks (- [x]) are never moved.").addToggle((toggle) => toggle.setValue(this.plugin.settings.includeCancelled).onChange(async (value) => { this.plugin.settings.includeCancelled = value; await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("Task tag").setDesc("Tag appended to migrated pending task lines that do not carry it yet (e.g. #task). Leave empty to add no tag.").addText((text) => text.setValue(this.plugin.settings.taskTag).onChange(async (value) => { this.plugin.settings.taskTag = value.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Task tag").setDesc("Tag written on migrated pending task lines that do not carry it yet (e.g. #task). Leave empty to add no tag.").addText((text) => text.setValue(this.plugin.settings.taskTag).onChange(async (value) => { this.plugin.settings.taskTag = value.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("Where the task tag goes").setDesc("Start of the task text, where the Tasks plugin puts the tag it creates itself, or the end of the line (before any {{...}} block). Only applies when the tag is added: one the line already carries is never moved. A leading 'h:mm' plan always stays in front of a tag placed at the start, so the ruler keeps reading the hour.").addDropdown((dropdown) => dropdown.addOption("start", "Start of the task text").addOption("end", "End of the line").setValue(this.plugin.settings.taskTagPosition === "end" ? "end" : "start").onChange(async (value) => { this.plugin.settings.taskTagPosition = value === "end" ? "end" : "start"; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Carry the source date onto migrated tasks").setDesc("Record the day a task came from on the line carried into today's note: a plain task gets ' ➕ YYYY-MM-DD' (unless it already has a ➕ date) and an Operon task with no start date gets '{{dateStarted:: YYYY-MM-DD}}'. Tasks that already carry their own date are left untouched.").addToggle((toggle) => toggle.setValue(this.plugin.settings.stampCreatedDate).onChange(async (value) => { this.plugin.settings.stampCreatedDate = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Clear the scheduling of an earlier day").setDesc("A pending task planned for the day it is leaving keeps a mark that pins it to that day: in a time-ruler (or any Dataview) column it shows under the past day instead of today's timeline, and dragging it is the only way out. With this on, the scheduling marks of an earlier day — time-ruler's '⏳ YYYY-MM-DD', '[scheduled:: ...]', '[date:: ...]', '[startTime::]', '[endTime::]', '[allDay::]', '[duration::]', '@{...}' and the leading 'h:mm - h:mm' — are dropped from the line carried into today's note, so the task arrives unscheduled and can be planned again. A bare 'h:mm' prefix carries no date because the ruler reads it against the note it lives in, so the day it means is the day the line came from, and it is cleared like the rest. Scheduling for today or a later day, and every other field ('due', 'start', tags, links, Operon '{{...}}'), is left alone; the '- [>]' left in the source note keeps the scheduling as the record of how that day was planned.").addToggle((toggle) => toggle.setValue(this.plugin.settings.clearPastSchedule).onChange(async (value) => { this.plugin.settings.clearPastSchedule = value; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("Migrate miscellaneous notes").addToggle((toggle) => toggle.setValue(this.plugin.settings.migrateNotes).onChange(async (value) => { this.plugin.settings.migrateNotes = value; await this.plugin.saveSettings(); }));
