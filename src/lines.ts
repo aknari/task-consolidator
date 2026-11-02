@@ -128,16 +128,26 @@ export function tagPresent(line: string, tag: string): boolean {
 }
 
 /**
+ * Any inline `[key:: value]` field, the form Dataview, the ruler and Quadrant
+ * share. Parentheses are excluded so a Markdown link is never mistaken for one.
+ */
+const ANY_INLINE_FIELD = /\s*\[[^\[\]()\n]*?::[^\[\]()\n]*?\]/gu;
+
+/**
  * Canonical form of a *plain* task line, used for comparisons and as its key:
- * `- [!]` becomes `- [ ]`, the managed tag and any ` ➕ YYYY-MM-DD` stamp are
- * dropped, whitespace is collapsed. Decorated and undecorated copies of the
- * same task therefore compare equal, whether the stamp came from this plugin or
- * was written by hand.
+ * `- [!]` becomes `- [ ]`, the managed tag, any ` ➕ YYYY-MM-DD` stamp and every
+ * inline `[key:: value]` field are dropped, whitespace is collapsed. Decorated
+ * and undecorated copies of the same task therefore compare equal, whether the
+ * decoration came from this plugin, was written by hand, or was added later by
+ * another one: placing a task in a quadrant writes `[eisenhower:: 2]` on its
+ * line, and that says where the task sits, not that it is a second task. Two
+ * copies that differ only by that field must never both travel.
  */
 export function normalizeTaskLine(line: string, taskTag: string): string {
   let normalized = line.replace(/- \[!\]/u, "- [ ]");
   if (taskTag !== "") normalized = normalized.replace(new RegExp(`(^|\\s)${escapeRegExp(taskTag)}(?!\\S)`, "gu"), "$1");
   normalized = normalized.replace(/\s*➕\s*\d{4}-\d{2}-\d{2}/gu, "");
+  normalized = normalized.replace(ANY_INLINE_FIELD, "");
   return normalized.trimEnd().replace(/\s+/gu, " ");
 }
 

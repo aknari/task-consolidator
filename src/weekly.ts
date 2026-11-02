@@ -99,9 +99,21 @@ const MULTI_SPACE = /\s+/g;
  */
 const SIMPLE_PREFIX = /^(?:\d{4}-\d{2}-\d{2}\s+)?\d{1,2}:\d{2}(?:\s*[-–—]\s*\d{1,2}:\d{2})?\s+/u;
 const TASKS_SCHEDULED = /\s*⏳\s*\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2})?/gu;
-const SCHEDULE_FIELD = /\s*\[\s*(?:scheduled|date|startTime|endTime|allDay|duration)\s*::\s*[^\]]*?\s*\]/gu;
-/** The older inline form of the `➕` stamp, reported the same way. */
-const CREATED_FIELD = /\s*\[\s*created\s*::\s*[^\]]*?\s*\]/gu;
+/**
+ * Any inline `[key:: value]` field: the older `[created:: …]` form of the `➕`
+ * stamp, the scheduling fields, and Quadrant's `[eisenhower:: 1]`…`[eisenhower:: 5]`.
+ *
+ * A field is where a task has been filed, never what it says, so it matters
+ * twice over. Reading: a line the board has since placed differs from its own
+ * earlier copy by nothing but the field, and leaving it in the text made those
+ * two the same task listed twice — which is exactly what a week of drops did.
+ * Writing: the summary is a report about the tasks, and another plugin's
+ * bookkeeping is not part of it.
+ *
+ * Parentheses are excluded from the match so a Markdown link or a value that
+ * happens to carry one is never mistaken for a field.
+ */
+const INLINE_FIELD = /\s*\[[^\[\]()\n]*?::[^\[\]()\n]*?\]/gu;
 
 interface Labels {
   week: (week: number, year: number) => string;
@@ -252,7 +264,7 @@ function combine(current: Occurrence, candidate: Occurrence): Occurrence {
 function toInertText(raw: string, taskTag: string): string {
   let text = raw.trimStart().replace(SIMPLE_PREFIX, "");
   text = text.replace(/\{\{[^}]*\}\}/g, " ");
-  text = text.replace(TASKS_SCHEDULED, "").replace(SCHEDULE_FIELD, "").replace(CREATED_FIELD, "");
+  text = text.replace(TASKS_SCHEDULED, "").replace(INLINE_FIELD, "");
   if (taskTag.trim() !== "") {
     const tag = taskTag.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     text = text.replace(new RegExp(`(^|\\s)${tag}(?!\\S)`, "gu"), "$1");
@@ -285,8 +297,11 @@ export function dedupeKey(text: string): string {
 
 /**
  * Reads every task line of the given notes (expected in ascending date order)
- * and returns them de-duplicated by text, so a task carried forward through
- * several notes of the same week is reported once. Which occurrence describes
+ * and returns them de-duplicated by text — the text that is left once the
+ * fields that only file or decorate a task are gone, so the copy the board has
+ * since placed keeps company with its own earlier copies — so a task carried
+ * forward through several notes of the same week is reported once. Which
+ * occurrence describes
  * the task is decided by `combine`: the state of a task is the last one really
  * written down, never the `[>]` tombstones the moves leave behind.
  */

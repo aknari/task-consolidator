@@ -171,6 +171,60 @@ check(
 // otherwise be inflated by ~40%: 18 raw records were 11 distinct tasks.
 check('no inflation from copied-forward lines', readWeeklyTasks(GROUP, READ).length, 2);
 
+// Quadrant writes `[eisenhower:: n]` on every line it places, and a task can be
+// placed days after it was carried forward. The field says where the task was
+// filed, not what it says, so the copy the board placed and the copy the source
+// kept are one task. Before this, every placed task of the week was reported
+// twice — a week of drops doubled most of the list.
+const PLACED: WeeklyNoteInput[] = [
+  {
+    date: '2026-10-27',
+    content: [
+      MARKERS.tasksStart,
+      '- [>] Comprar lámpara UV #aliexpress #task ➕ 2026-10-26',
+      '- [>] Anunciar los plugins en Discord #task ➕ 2026-10-28',
+      MARKERS.tasksEnd,
+    ].join('\n'),
+  },
+  {
+    date: '2026-10-30',
+    content: [
+      MARKERS.tasksStart,
+      '- [>] Comprar lámpara UV #aliexpress #task ➕ 2026-10-26 [eisenhower:: 2]',
+      '- [x] Anunciar los plugins en Discord #task ➕ 2026-10-28 [eisenhower:: 4] ✅ 2026-10-30',
+      MARKERS.tasksEnd,
+    ].join('\n'),
+  },
+];
+check(
+  'a quadrant field does not make a second task',
+  readWeeklyTasks(PLACED, READ).map((t) => [t.state, t.text]),
+  [
+    ['pending', 'Comprar lámpara UV #aliexpress'],
+    ['completed', 'Anunciar los plugins en Discord'],
+  ],
+);
+const placedOut = buildWeeklySummary(PLACED, RENDER).join('\n');
+check('the quadrant is not copied into the report', placedOut.includes('eisenhower'), false);
+check(
+  'and the counts follow: one pending, one completed',
+  placedOut.includes('**Pendientes (1)**') && placedOut.includes('**Completadas (1)**'),
+  true,
+);
+// The field pattern must not swallow a link's brackets: a value never spans
+// parentheses, which is what keeps a file: or https: URL out of the match.
+check(
+  'a link is not mistaken for a field',
+  readWeeklyTasks(
+    [{
+      date: '2026-09-10',
+      content: [MARKERS.tasksStart, '- [ ] Leer el libro [Administración](file:///ruta/libro.pdf) #task', MARKERS.tasksEnd].join('\n'),
+    }],
+    READ,
+  ).map((t) => t.text),
+  ['Leer el libro [Administración](file:///ruta/libro.pdf)'],
+);
+
 // --------------------------------------------------------------------------
 // Scheduling is not part of the week's story
 // --------------------------------------------------------------------------

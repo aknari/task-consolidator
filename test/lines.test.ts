@@ -101,6 +101,14 @@ check(
   normalizeTaskLine(PLAIN_IMPORTANT, '#task'),
   '- [ ] Mirar el vuelo de Riga a Gran Canaria',
 );
+// Quadrant writes `[eisenhower:: n]` on every line it places. Where a task has
+// been filed is not what the task is, so the placed copy and the plain one are
+// one task, and consolidation must not carry both into today's note.
+check(
+  'a quadrant field does not make a second task',
+  taskKey('- [ ] Comprar lámpara UV #aliexpress #task ➕ 2026-10-26 [eisenhower:: 2]', '#task'),
+  '- [ ] Comprar lámpara UV #aliexpress',
+);
 
 // --------------------------------------------------------------------------
 // Migration into today's note
